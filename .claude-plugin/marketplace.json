@@ -1,0 +1,16 @@
+{
+  "name": "tokenforward",
+  "owner": {
+    "name": "Sayonsom Chanda"
+  },
+  "plugins": [
+    {
+      "name": "tokenforward",
+      "source": "./",
+      "description": "Budget-first agentic development for Claude Code."
+    }
+  ],
+  "metadata": {
+    "description": "TokenForward: budget-first agentic development plugins."
+  }
+}

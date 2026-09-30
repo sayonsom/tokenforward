@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""TokenForward: budget-first agentic development for Claude Code.
+
+One stdlib-only file. Subcommands:
+  hook-prompt | hook-pretool | hook-posttool | hook-stop   (Claude Code hooks, JSON on stdin)
+  statusline                                              (Claude Code statusLine command)
+  status | off                                            (manual control, run inside the project)
+
+Budget unit: "effective tokens" (etok) = input-token equivalents, priced like the API:
+  etok = input + 1.25*cache_write + 0.1*cache_read + 5*output
+For every current Claude model output costs 5x input, so etok is proportional to dollars:
+  usd = etok * TF_USD_PER_MTOK_IN / 1e6   (default 3.0; set it to your model's input price)
+"""
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+import sys
+import time
+
+W_IN, W_CW, W_CR, W_OUT = 1.0, 1.25, 0.1, 5.0
+USD_PER_MTOK = float(os.environ.get("TF_USD_PER_MTOK_IN", "3.0"))
+BIG_FILE_LINES = int(os.environ.get("TF_BIG_FILE_LINES", "300"))
+ENFORCE = os.environ.get("TF_ENFORCE", "1") != "0"
+
+# Forward allocation: the budget is committed to phases before work starts.
+PHASES = [("map", 0.25), ("build", 0.45), ("verify", 0.20), ("reserve", 0.10)]
+
+PROTOCOL = """TokenForward budget active: {budget} etok (~${usd:.2f}). Phases: map 25% | build 45% | verify 20% | reserve 10%.
+Rules:
+1. Map: {map_hint} Grep -n to locate, then Read with offset/limit (<=120 lines). Never read a whole file over {big} lines. Never re-read a range already in context.
+2. Spec card, in your reply, <=8 lines: Goal / Interface / Touch (files) / Acceptance (test names) / Out of scope. No spec files, no plan files. Ambiguity: state one assumption, continue.
+3. Write the failing tests first. They are the spec. Then the smallest implementation that passes.{ponytail}
+4. Verify: targeted `pytest <file> -q -x` first, then one broad `pytest -q` run. Fix, do not rewrite.
+5. Batch independent tool calls in one turn. No narration between tool calls. Prefer Edit over Write.
+6. At 80% spend: finish mode, no new exploration. At 100% tools are blocked: stop and report."""
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def parse_budget(text: str) -> int | None:
+    t = text.lower().replace(",", "")
+    pats = [
+        r"^\s*/(?:tokenforward:)?tfd\s+(\d+(?:\.\d+)?)\s*([km]?)\b",
+        r"(?:budget|max(?:imum)?|spend|cap|limit)[^\d\n]{0,25}(\d+(?:\.\d+)?)\s*([km]?)\s*(?:e?tok(?:en)?s?)\b",
+        r"(\d+(?:\.\d+)?)\s*([km]?)\s*(?:e?tok(?:en)?s?)\s*(?:budget|max|cap|limit)\b",
+    ]
+    for p in pats:
+        m = re.search(p, t)
+        if m:
+            n = float(m.group(1)) * {"": 1, "k": 1e3, "m": 1e6}[m.group(2)]
+            return int(n) if n >= 1000 else None
+    return None
+
+
+# ---------- state ----------
+
+def state_path(cwd: str) -> str:
+    root = os.environ.get("CLAUDE_PROJECT_DIR") or cwd or os.getcwd()
+    d = os.path.join(root, ".tokenforward")
+    os.makedirs(d, exist_ok=True)
+    gi = os.path.join(d, ".gitignore")
+    if not os.path.exists(gi):
+        open(gi, "w").write("*\n")
+    return os.path.join(d, "state.json")
+
+
+def load(cwd):
+    try:
+        return json.load(open(state_path(cwd)))
+    except Exception:
+        return {}
+
+
+def save(cwd, st):
+    p = state_path(cwd)
+    tmp = p + ".tmp"
+    json.dump(st, open(tmp, "w"), indent=1)
+    os.replace(tmp, p)
+
+
+# ---------- usage accounting ----------
+
+def transcript_files(tp: str) -> list[str]:
+    if not tp:
+        return []
+    files = [tp] if os.path.exists(tp) else []
+    base = tp[:-6] if tp.endswith(".jsonl") else tp
+    files += glob.glob(os.path.join(base, "subagents", "*.jsonl"))  # subagent sidechains
+    return files
+
+
+def usage(tp: str) -> dict:
+    """Sum usage across main + subagent transcripts, deduped by message id."""
+    seen: dict[str, dict] = {}
+    turns = 0
+    for f in transcript_files(tp):
+        try:
+            fh = open(f, encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                msg = o.get("message") or {}
+                u = msg.get("usage")
+                if o.get("type") != "assistant" or not u:
+                    continue
+                mid = msg.get("id") or o.get("uuid") or str(len(seen))
+                seen[f + mid] = u
+    tot = {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0}
+    for u in seen.values():
+        turns += 1
+        tot["input"] += u.get("input_tokens", 0) or 0
+        tot["cache_write"] += u.get("cache_creation_input_tokens", 0) or 0
+        tot["cache_read"] += u.get("cache_read_input_tokens", 0) or 0
+        tot["output"] += u.get("output_tokens", 0) or 0
+    tot["etok"] = int(tot["input"] * W_IN + tot["cache_write"] * W_CW
+                      + tot["cache_read"] * W_CR + tot["output"] * W_OUT)
+    tot["turns"] = turns
+    return tot
+
+
+def spent(sess: dict, tp: str) -> tuple[int, dict]:
+    u = usage(tp)
+    return max(0, u["etok"] - sess.get("base_etok", 0)), u
+
+
+def fmt(n: int) -> str:
+    return f"{n / 1e6:.2f}M" if n >= 1e6 else f"{n / 1e3:.1f}k"
+
+
+def phase_limits(budget: int) -> dict:
+    out, acc = {}, 0.0
+    for name, frac in PHASES:
+        acc += frac
+        out[name] = int(budget * acc)
+    return out
+
+
+# ---------- ecosystem detection ----------
+
+def has_graph(cwd: str) -> bool:
+    return os.path.exists(os.path.join(cwd or ".", "graphify-out", "graph.json"))
+
+
+def has_ponytail() -> bool:
+    if os.environ.get("TF_PONYTAIL") == "1":
+        return True
+    home = os.path.expanduser("~/.claude/plugins")
+    return bool(glob.glob(os.path.join(home, "**", "ponytail*"), recursive=True)) or \
+        "ponytail" in os.environ.get("TF_PLUGIN_DIRS", "")
+
+
+# ---------- hooks ----------
+
+def out(obj):
+    print(json.dumps(obj))
+    sys.exit(0)
+
+
+def hook_prompt(ev: dict):
+    cwd, sid, tp = ev.get("cwd", ""), ev.get("session_id", "x"), ev.get("transcript_path", "")
+    st = load(cwd)
+    b = parse_budget(ev.get("prompt", ""))
+    if b:
+        u = usage(tp)
+        st[sid] = {"budget": b, "base_etok": u["etok"], "phase": "map", "reads": {},
+                   "denied_big": [], "warned80": False, "started": time.time(),
+                   "phase_at": {}, "ecosystem": {"graphify": has_graph(cwd), "ponytail": has_ponytail()}}
+        save(cwd, st)
+        eco = st[sid]["ecosystem"]
+        ctx = PROTOCOL.format(
+            budget=fmt(b), usd=b * USD_PER_MTOK / 1e6, big=BIG_FILE_LINES,
+            map_hint=("`graphify query \"<question>\"` first (graph is built)." if eco["graphify"]
+                      else "No graph: use Glob on names only."),
+            ponytail=(" Ponytail rules apply: stdlib first, no speculative code." if eco["ponytail"] else
+                      " Minimal code: stdlib first, no speculative options, no docstrings beyond one line."))
+        out({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}})
+    sess = st.get(sid)
+    if sess:
+        s, _ = spent(sess, tp)
+        out({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+             "additionalContext": f"TokenForward: {fmt(s)}/{fmt(sess['budget'])} etok used, phase {sess['phase']}."}})
+    sys.exit(0)
+
+
+def deny(reason: str):
+    out({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                "permissionDecision": "deny", "permissionDecisionReason": reason}})
+
+
+def line_count(path: str) -> int:
+    try:
+        with open(path, "rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+def hook_pretool(ev: dict):
+    cwd, sid, tp = ev.get("cwd", ""), ev.get("session_id", "x"), ev.get("transcript_path", "")
+    st = load(cwd)
+    sess = st.get(sid)
+    if not sess or not ENFORCE:
+        sys.exit(0)
+    s, _ = spent(sess, tp)
+    tool, ti = ev.get("tool_name", ""), ev.get("tool_input", {}) or {}
+    if s >= sess["budget"]:
+        deny(f"TokenForward: budget exhausted ({fmt(s)}/{fmt(sess['budget'])}). "
+             "Do not call more tools. Reply with: what is done, what is left, exact next command.")
+
+    if tool == "Read":
+        fp = ti.get("file_path", "")
+        off, lim = ti.get("offset"), ti.get("limit")
+        key = f"{fp}:{off or 0}:{lim or 'all'}"
+        n = line_count(fp)
+        if lim is None and n > BIG_FILE_LINES and fp not in sess["denied_big"]:
+            sess["denied_big"].append(fp)
+            save(cwd, st)
+            deny(f"TokenForward: {os.path.basename(fp)} has {n} lines (~{n * 12 // 1000}k tokens, "
+                 f"paid again on every later turn). Locate with Grep -n "
+                 f"{'or graphify query ' if sess['ecosystem'].get('graphify') else ''}"
+                 f"then Read with offset/limit <= 120. Retry once more to override.")
+        if key in sess["reads"] and key not in sess.setdefault("denied_rr", []):
+            sess["denied_rr"].append(key)
+            save(cwd, st)
+            deny(f"TokenForward: {os.path.basename(fp)} range already read at turn "
+                 f"{sess['reads'][key]} and unchanged since. Use what is in context (retry to override after compaction).")
+        sess["reads"][key] = usage(tp)["turns"]
+        save(cwd, st)
+
+    if tool == "Bash":
+        cmd = ti.get("command", "")
+        m = re.match(r"\s*cat\s+([^\s|;&>]+)\s*$", cmd)
+        if m and line_count(os.path.join(cwd, m.group(1))) > BIG_FILE_LINES:
+            deny("TokenForward: cat of a large file. Use Grep -n, then Read with offset/limit.")
+    sys.exit(0)
+
+
+def hook_posttool(ev: dict):
+    cwd, sid, tp = ev.get("cwd", ""), ev.get("session_id", "x"), ev.get("transcript_path", "")
+    st = load(cwd)
+    sess = st.get(sid)
+    if not sess:
+        sys.exit(0)
+    tool, ti = ev.get("tool_name", ""), ev.get("tool_input", {}) or {}
+    s, _ = spent(sess, tp)
+    # Zero-cost phase inference: first edit -> build, first test run after an edit -> verify.
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        fp = ti.get("file_path", "")
+        sess["reads"] = {k: v for k, v in sess["reads"].items() if not k.startswith(fp + ":")}
+        if sess["phase"] == "map":
+            sess["phase"], sess["phase_at"]["build"] = "build", s
+    if tool == "Bash" and re.search(r"\b(pytest|tox|nox|unittest)\b", ti.get("command", "")) \
+            and sess["phase"] == "build":
+        sess["phase"], sess["phase_at"]["verify"] = "verify", s
+    msgs = []
+    lim = phase_limits(sess["budget"])
+    if sess["phase"] == "map" and s > lim["map"] and not sess.get("warned_map"):
+        sess["warned_map"] = True
+        msgs.append(f"TokenForward: map phase over allocation ({fmt(s)} > {fmt(lim['map'])}). "
+                    "Stop exploring. Write the spec card and the failing tests now.")
+    if s >= 0.8 * sess["budget"] and not sess["warned80"]:
+        sess["warned80"] = True
+        msgs.append(f"TokenForward: 80% spent ({fmt(s)}/{fmt(sess['budget'])}). Finish mode: "
+                    "no new reads, close out the current change, run the tests once.")
+    save(cwd, st)
+    if msgs:
+        out({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": " ".join(msgs)}})
+    sys.exit(0)
+
+
+def hook_stop(ev: dict):
+    cwd, sid, tp = ev.get("cwd", ""), ev.get("session_id", "x"), ev.get("transcript_path", "")
+    st = load(cwd)
+    sess = st.get(sid)
+    if not sess:
+        sys.exit(0)
+    s, u = spent(sess, tp)
+    rec = {"session_id": sid, "budget": sess["budget"], "spent_etok": s,
+           "pct": round(100 * s / sess["budget"], 1), "usd_est": round(s * USD_PER_MTOK / 1e6, 4),
+           "phase_final": sess["phase"], "phase_at": sess["phase_at"], "usage_raw": u,
+           "ecosystem": sess["ecosystem"], "denied_big_reads": sess["denied_big"],
+           "elapsed_s": round(time.time() - sess["started"], 1)}
+    d = os.path.join(os.path.dirname(state_path(cwd)), "receipts")
+    os.makedirs(d, exist_ok=True)
+    json.dump(rec, open(os.path.join(d, f"{sid}.json"), "w"), indent=1)
+    sys.exit(0)
+
+
+def statusline():
+    try:
+        ev = json.load(sys.stdin)
+    except ValueError:
+        ev = {}
+    cwd = (ev.get("workspace") or {}).get("current_dir") or ev.get("cwd", "")
+    sess = load(cwd).get(ev.get("session_id", ""))
+    if not sess:
+        print("TF off")
+        return
+    s, _ = spent(sess, ev.get("transcript_path", ""))
+    pct = min(1.0, s / sess["budget"])
+    bar = "#" * int(pct * 10) + "-" * (10 - int(pct * 10))
+    print(f"TF [{bar}] {fmt(s)}/{fmt(sess['budget'])} etok {pct * 100:.0f}% "
+          f"~${s * USD_PER_MTOK / 1e6:.2f} | {sess['phase']}")
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    hooks = {"hook-prompt": hook_prompt, "hook-pretool": hook_pretool,
+             "hook-posttool": hook_posttool, "hook-stop": hook_stop}
+    if cmd in hooks:
+        try:
+            ev = json.load(sys.stdin)
+        except ValueError:
+            sys.exit(0)
+        try:
+            hooks[cmd](ev)
+        except SystemExit:
+            raise
+        except Exception as e:  # a broken hook must never block the user
+            eprint(f"tokenforward: {e}")
+            sys.exit(0)
+    elif cmd == "statusline":
+        statusline()
+    elif cmd == "status":
+        print(json.dumps(load(os.getcwd()), indent=1))
+    elif cmd == "off":
+        save(os.getcwd(), {})
+        print("TokenForward budgets cleared.")
+    else:
+        eprint(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+{
+  "name": "tokenforward",
+  "version": "0.1.0",
+  "description": "Token-forward development: declare a token budget up front, get it allocated across map/build/verify, enforced by hooks, and a receipt at the end. Composes with graphify and ponytail.",
+  "author": { "name": "Sayonsom Chanda" },
+  "keywords": ["tokens", "budget", "spec-driven", "brownfield", "cost"]
+}
