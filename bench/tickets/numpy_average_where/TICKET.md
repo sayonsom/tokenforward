@@ -11,4 +11,4 @@ Add a `where=` parameter to `np.average` and `np.ma.average`, matching the seman
 9. Document `where` in both docstrings with `.. versionadded:: 2.5.0`, and add a release note fragment `doc/release/upcoming_changes/<number>.new_feature.rst`.
 10. Add tests.
 
-Environment: numpy is not compiled in this checkout; do not try to build it. Run tests with `./run_tests.sh <pytest args>`, e.g. `./run_tests.sh numpy/lib/tests/test_function_base.py -k average -q`. It overlays your Python and stub changes onto a prebuilt numpy 2.4.6.
+Environment: numpy is not compiled in this checkout; do not try to build it. Run tests with `python run_tests.py <pytest args>`, e.g. `python run_tests.py numpy/lib/tests/test_function_base.py -k average -q`. It overlays your Python and stub changes onto a prebuilt numpy 2.4.6.

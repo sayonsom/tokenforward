@@ -45,11 +45,11 @@ ACCEPT_N = 0
 def load_ticket(name):
     global TICKET, ACCEPT_DIR, ACCEPT_N, TARGET
     d = os.path.join(HERE, "tickets", name)
-    TARGET = json.load(open(os.path.join(d, "target.json")))
+    TARGET = json.load(open(os.path.join(d, "target.json"), encoding="utf-8"))
     TARGET["ticket_dir"] = d
-    TICKET = open(os.path.join(d, "TICKET.md")).read().strip()
+    TICKET = open(os.path.join(d, "TICKET.md"), encoding="utf-8").read().strip()
     ACCEPT_DIR = os.path.join(d, "acceptance")
-    ACCEPT_N = sum(open(f).read().count("\ndef test_") for f in glob.glob(os.path.join(ACCEPT_DIR, "test_*.py")))
+    ACCEPT_N = sum(open(f, encoding="utf-8").read().count("\ndef test_") for f in glob.glob(os.path.join(ACCEPT_DIR, "test_*.py")))
 HEADLESS = "\n\nThis is a non-interactive run. Do not ask questions; make reasonable assumptions and finish the work."
 
 SPECKIT_SETUP = "/speckit-constitution Keep changes minimal and consistent with this project's existing conventions. Every feature ships with tests."
@@ -62,12 +62,34 @@ def speckit_steps():
             "/speckit-implement"]
 
 
-def sh(cmd, cwd=None, env=None, timeout=None, check=True):
-    r = subprocess.run(cmd, cwd=cwd, env=env, timeout=timeout, text=True,
-                       capture_output=True, shell=isinstance(cmd, str))
+WINDOWS = os.name == "nt"
+
+
+def exe(name):
+    """Resolve a CLI to its full path (claude.cmd, graphify.exe, ... on Windows)."""
+    return shutil.which(name) or name
+
+
+def sh(cmd, cwd=None, env=None, timeout=None, check=True, input=None):
+    """Run a command given as a list. No shell, so it behaves the same on Windows and POSIX."""
+    cmd = [exe(cmd[0]), *cmd[1:]]
+    r = subprocess.run(cmd, cwd=cwd, env=env, timeout=timeout, text=True, encoding="utf-8",
+                       errors="replace", capture_output=True, input=input)
     if check and r.returncode != 0:
         raise RuntimeError(f"{cmd}\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
     return r
+
+
+def git_commit(cwd, msg):
+    sh(["git", "add", "-A"], cwd=cwd)
+    sh(["git", "-c", "user.email=b@b", "-c", "user.name=bench", "commit", "-q", "--allow-empty", "-m", msg], cwd=cwd)
+
+
+def rmtree(p):
+    def onerr(func, path, _):  # git packs are read-only on Windows
+        os.chmod(path, 0o700)
+        func(path)
+    shutil.rmtree(p, onerror=onerr)
 
 
 def log(*a):
@@ -78,7 +100,7 @@ def log(*a):
 
 def wheel_site(py, version):
     """site-packages dir holding the prebuilt numpy wheel (queried from / so the source tree never shadows it)."""
-    r = sh([py, "-c", "import numpy, os; print(numpy.__version__); print(os.path.dirname(os.path.dirname(numpy.__file__)))"], cwd="/")
+    r = sh([py, "-c", "import numpy, os; print(numpy.__version__); print(os.path.dirname(os.path.dirname(numpy.__file__)))"], cwd=os.path.abspath(os.sep))
     v, site = r.stdout.split()
     if v != version:
         raise SystemExit(f"need numpy=={version} installed in {py}, found {v}")
@@ -90,20 +112,20 @@ def prepare(work, a):
     if not os.path.exists(base):
         log("cloning", TARGET["label"])
         if "ref" in TARGET:
-            sh(["git", "clone", "-q", "--depth", "1", "--branch", TARGET["ref"], TARGET["repo"], base])
+            sh(["git", "clone", "-q", "-c", "core.autocrlf=false", "--depth", "1", "--branch", TARGET["ref"], TARGET["repo"], base])
         else:
-            sh(["git", "clone", "-q", TARGET["repo"], base])
+            sh(["git", "clone", "-q", "-c", "core.autocrlf=false", TARGET["repo"], base])
             sh(["git", "checkout", "-q", TARGET["commit"]], cwd=base)
         if TARGET["mode"] == "numpy-overlay":
             site = wheel_site(a.python, TARGET["wheel_version"])
-            src = open(os.path.join(TARGET["ticket_dir"], "run_tests.sh")).read()
+            src = open(os.path.join(TARGET["ticket_dir"], "run_tests.py"), encoding="utf-8").read()
             src = src.replace("__WHEEL_SITE__", site).replace("__PYTHON__", a.python) \
                      .replace("__NP_VERSION__", TARGET["wheel_version"])
-            open(os.path.join(base, "run_tests.sh"), "w").write(src)
-            os.chmod(os.path.join(base, "run_tests.sh"), 0o755)
+            with open(os.path.join(base, "run_tests.py"), "w", encoding="utf-8") as f:
+                f.write(src)
             with open(os.path.join(base, ".git", "info", "exclude"), "a") as f:
                 f.write("\n.numpy-overlay/\n")
-            sh("git add run_tests.sh && git -c user.email=b@b -c user.name=bench commit -qm 'bench env'", cwd=base)
+            git_commit(base, "bench env")
         sh(["git", "tag", "-f", "bench-base"], cwd=base)
     pt = os.path.join(work, "ponytail")
     if not os.path.exists(pt):
@@ -119,11 +141,18 @@ def _pytest(cwd, paths, py, env):
     return fails, int(m.group(1)) if m else 0, r.stdout[-600:]
 
 
+_PY = [sys.executable]
+
+
+def a_python():
+    return _PY[0]
+
+
 def failing(repo, paths, py, acceptance=False):
     """Run pytest against an arm checkout. Returns (failed ids, passed count, tail)."""
     env = dict(os.environ)
     if TARGET["mode"] == "numpy-overlay":
-        sh([os.path.join(repo, "run_tests.sh"), "--sync-only"], cwd=repo)
+        sh([a_python(), os.path.join(repo, "run_tests.py"), "--sync-only"], cwd=repo)
         ov = os.path.join(repo, ".numpy-overlay")
         if acceptance:
             env.update(PYTHONPATH=ov, NP_REPO=repo)
@@ -136,7 +165,7 @@ def failing(repo, paths, py, acceptance=False):
 def new_arm_dir(work, base, name):
     d = os.path.join(work, name)
     if os.path.exists(d):
-        shutil.rmtree(d)
+        rmtree(d)
     shutil.copytree(base, d, symlinks=True)
     with open(os.path.join(d, ".git", "info", "exclude"), "a") as f:
         f.write("\ngraphify-out/\n.tokenforward/\n")
@@ -144,19 +173,21 @@ def new_arm_dir(work, base, name):
 
 
 def commit_scaffold(d, msg):
-    sh("git add -A && git -c user.email=b@b -c user.name=bench commit -qm '%s' --allow-empty" % msg, cwd=d)
+    git_commit(d, msg)
     return sh(["git", "rev-parse", "HEAD"], cwd=d).stdout.strip()
 
 
 # ---------------- run claude ----------------
 
 def claude(prompt, cwd, model, extra=(), resume=None, timeout=2400, env=None):
-    cmd = ["claude", "-p", prompt, "--output-format", "json", "--model", model,
+    # Multi-line prompts cannot pass through a .cmd shim on Windows, so send them on stdin there.
+    via_stdin = WINDOWS and exe("claude").lower().endswith((".cmd", ".bat"))
+    cmd = ["claude", "-p", *([] if via_stdin else [prompt]), "--output-format", "json", "--model", model,
            "--dangerously-skip-permissions", *extra]
     if resume:
         cmd += ["--resume", resume]
     t0 = time.time()
-    r = sh(cmd, cwd=cwd, env=env, timeout=timeout, check=False)
+    r = sh(cmd, cwd=cwd, env=env, timeout=timeout, check=False, input=prompt if via_stdin else None)
     try:
         j = json.loads(r.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -200,6 +231,22 @@ def summarize_calls(calls):
     return tot
 
 
+def write_spec(d):
+    os.makedirs(os.path.join(d, ".tokenforward"), exist_ok=True)
+    with open(os.path.join(d, ".tokenforward", "spec.md"), "w", encoding="utf-8") as f:
+        f.write(TICKET + "\n")
+
+
+def tfd_prompt(budget, spec_rel):
+    """Same instructions as the /tfd command, with the launcher path spelled out for headless runs."""
+    launcher = os.path.join(ROOT, "scripts", "tf-launch.js").replace(os.sep, "/")
+    return (f"Implement the spec in `{spec_rel}` under a {budget} token budget.\n"
+            f"Before anything else, run exactly once: node \"{launcher}\" plan {budget} {spec_rel}\n"
+            "It plans what fits (zero tokens) and arms the budget. Implement only the admitted items, in order, "
+            "following the TokenForward protocol injected after that command. Final reply: the changelog only."
+            + ("\n\n" + TICKET.split("Environment:", 1)[1].strip() if "Environment:" in TICKET else ""))
+
+
 def run_arm(arm, work, base, pt, a):
     d = new_arm_dir(work, base, f"{arm}-r{a.run_idx}")
     extra, env = [], dict(os.environ)
@@ -207,7 +254,7 @@ def run_arm(arm, work, base, pt, a):
     if arm.startswith("speckit"):
         # Warm Spec Kit: the team already initialised it and wrote a constitution. Not counted.
         sh(["specify", "init", "--here", "--force", "--non-interactive",
-            "--integration", "claude", "--script", "sh"], cwd=d)
+            "--integration", "claude", "--script", a.speckit_script], cwd=d)
         setup_cost = claude(SPECKIT_SETUP + HEADLESS, d, a.model).get("total_cost_usd") or 0
         log(f"[speckit] setup (constitution, excluded) ${setup_cost:.3f}")
     if arm.startswith("tfd") or arm == "speckit-tfd":
@@ -227,15 +274,25 @@ def run_arm(arm, work, base, pt, a):
         calls.append(claude(TICKET + HEADLESS, d, a.model))
     elif arm.startswith("speckit"):
         sid = None
-        for n, step in enumerate(speckit_steps()):
-            if arm == "speckit-tfd" and n == 0:
-                step = f"Budget: max {a.budget} tokens.\n\n" + step
+        for step in speckit_steps():
+            if arm == "speckit-tfd" and step.startswith("/speckit-implement"):
+                # Spec Kit does the thinking; TokenForward executes tasks.md under the budget.
+                tasks = sorted(glob.glob(os.path.join(d, "specs", "*", "tasks.md")), key=os.path.getmtime)
+                spec_rel = os.path.relpath(tasks[-1], d).replace(os.sep, "/") if tasks else ".tokenforward/spec.md"
+                if not tasks:
+                    write_spec(d)
+                step = tfd_prompt(a.budget, spec_rel)
             j = claude(step + HEADLESS, d, a.model, resume=sid, extra=extra, env=env)
             calls.append(j)
             sid = j.get("session_id") or sid
             log(f"[{arm}] {step.split()[0]} ${j.get('total_cost_usd', 0):.3f} turns={j.get('num_turns')}")
     elif arm.startswith("tfd"):
-        prompt = (f"/tokenforward:tfd {a.budget} " if a.tfd_slash else f"Budget: max {a.budget} tokens.\n\n") + TICKET
+        if a.tfd_slash:
+            write_spec(d)
+            prompt = f"/tokenforward:tfd {a.budget} .tokenforward/spec.md"
+        else:
+            write_spec(d)
+            prompt = tfd_prompt(a.budget, ".tokenforward/spec.md")
         calls.append(claude(prompt + HEADLESS, d, a.model, extra=extra, env=env))
 
     res = summarize_calls(calls)
@@ -248,7 +305,7 @@ def run_arm(arm, work, base, pt, a):
     if not a.skip_regress:
         f, _, _ = failing(d, TARGET["regress"], a.python)
         res["regressions"] = sorted(f - a.baseline_fail)
-    sh("git add -A", cwd=d)
+    sh(["git", "add", "-A"], cwd=d)
     ns = sh(["git", "diff", "--cached", "--numstat", head], cwd=d).stdout
     src = tests = spec_docs = docs = 0
     files = []
@@ -256,7 +313,7 @@ def run_arm(arm, work, base, pt, a):
         add, _, path = line.split("\t", 2)
         if add == "-":
             continue
-        if path == "run_tests.sh":
+        if path in ("run_tests.sh", "run_tests.py"):
             continue
         if path.startswith(("specs/", ".specify/memory")):
             spec_docs += int(add)
@@ -273,7 +330,7 @@ def run_arm(arm, work, base, pt, a):
     res.update(loc_src=src, loc_tests=tests, loc_docs=docs, spec_doc_lines=spec_docs, files_changed=files)
     receipts = glob.glob(os.path.join(d, ".tokenforward", "receipts", "*.json"))
     if receipts:
-        res["tf_receipt"] = json.load(open(receipts[0]))
+        res["tf_receipt"] = json.load(open(receipts[0], encoding="utf-8"))
     res["result_tail"] = str(calls[-1].get("result", ""))[-800:]
     return res
 
@@ -305,7 +362,7 @@ def aggregate(rows):
 
 
 def report(outdir):
-    rows = json.load(open(os.path.join(outdir, "results.json")))["runs"]
+    rows = json.load(open(os.path.join(outdir, "results.json"), encoding="utf-8"))["runs"]
     agg = aggregate(rows)
     arms = [a for a in ARM_ORDER if a in agg]
     metrics = [("cost_usd", "Cost (USD)", "${:.2f}"), ("etok", "Effective tokens", "{:,.0f}"),
@@ -380,7 +437,8 @@ td,th{{text-align:left;padding:8px;border-bottom:1px solid var(--grid)}} th{{col
 Cost is the CLI's own total_cost_usd. Acceptance tests were never shown to any arm. Regressions = existing project tests that newly fail.</p>
 </main></body></html>"""
     p = os.path.join(outdir, "report.html")
-    open(p, "w").write(html)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(html)
     log("report:", p)
     for a in arms:
         g = agg[a]
@@ -401,12 +459,15 @@ def main():
     ap.add_argument("--usd-per-mtok", type=float, default=3.0)
     ap.add_argument("--tfd-slash", action="store_true", help="invoke /tokenforward:tfd instead of a budget sentence")
     ap.add_argument("--skip-regress", action="store_true")
+    ap.add_argument("--speckit-script", default="sh", choices=["sh", "ps"],
+                    help="Spec Kit helper scripts. sh works on Windows too (Claude Code's Bash tool is Git Bash)")
     ap.add_argument("--report-only")
     a = ap.parse_args()
     if a.report_only:
         return report(a.report_only)
     load_ticket(a.ticket)
-    a.arms = a.arms.replace("tfd,", "tfd-graph,").rstrip(",")
+    _PY[0] = a.python
+    a.arms = ",".join("tfd-graph" if x == "tfd" else x for x in a.arms.split(",") if x)
 
     os.makedirs(a.work, exist_ok=True)
     base, pt = prepare(a.work, a)
@@ -424,7 +485,7 @@ def main():
             rows.append(r)
             log(f"[{arm}] ${r['cost_usd']:.3f} etok={r['etok']:,} accept={r['acceptance_pass']}/{r['acceptance_total']}")
             json.dump({"ticket": TICKET, "target": TARGET, "runs": rows},
-                      open(os.path.join(outdir, "results.json"), "w"), indent=1)
+                      open(os.path.join(outdir, "results.json"), "w", encoding="utf-8"), indent=1)
     report(outdir)
 
 

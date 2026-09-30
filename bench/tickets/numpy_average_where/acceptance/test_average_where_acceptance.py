@@ -115,7 +115,7 @@ def test_docstrings():
 
 
 def test_every_stub_overload_accepts_where():
-    src = open(os.path.join(REPO, "numpy", "lib", "_function_base_impl.pyi")).read()
+    src = open(os.path.join(REPO, "numpy", "lib", "_function_base_impl.pyi"), encoding="utf-8").read()
     blocks = re.findall(r"^def average\((.*?)\) ->", src, re.M | re.S)
     assert len(blocks) >= 20
     assert all(re.search(r"\bwhere\s*:", b) for b in blocks), sum(1 for b in blocks if "where" not in b)
@@ -123,4 +123,4 @@ def test_every_stub_overload_accepts_where():
 
 def test_release_note_fragment():
     frags = glob.glob(os.path.join(REPO, "doc", "release", "upcoming_changes", "*.new_feature.rst"))
-    assert any("average" in open(f).read() and "where" in open(f).read() for f in frags)
+    assert any("average" in open(f, encoding="utf-8").read() and "where" in open(f, encoding="utf-8").read() for f in frags)

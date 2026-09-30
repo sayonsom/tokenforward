@@ -35,7 +35,13 @@ Rules:
 3. Write the failing tests first. They are the spec. Then the smallest implementation that passes.{ponytail}
 4. Verify: targeted `pytest <file> -q -x` first, then one broad `pytest -q` run. Fix, do not rewrite.
 5. Batch independent tool calls in one turn. No narration between tool calls. Prefer Edit over Write.
-6. At 80% spend: finish mode, no new exploration. At 100% tools are blocked: stop and report."""
+6. At 80% spend: finish mode, no new exploration. At 100% tools are blocked: stop and report.
+7. Final reply is the changelog, nothing else, <=8 lines:
+   Done: <items> | Deferred: <items + reason> | Files: <paths> | Tests: <pass/total, command> | Notes: <one line, only if needed>{plan}"""
+
+PLAN_CTX = """
+Plan (computed locally, 0 tokens): implement ONLY these items, in order: {admitted}. Deferred by budget: {deferred}.
+Estimate {est} of {budget}. Do not start a deferred item; list it under Deferred."""
 
 
 def eprint(*a):
@@ -65,13 +71,13 @@ def state_path(cwd: str) -> str:
     os.makedirs(d, exist_ok=True)
     gi = os.path.join(d, ".gitignore")
     if not os.path.exists(gi):
-        open(gi, "w").write("*\n")
+        open(gi, "w", encoding="utf-8").write("*\n")
     return os.path.join(d, "state.json")
 
 
 def load(cwd):
     try:
-        return json.load(open(state_path(cwd)))
+        return json.load(open(state_path(cwd), encoding="utf-8"))
     except Exception:
         return {}
 
@@ -79,7 +85,8 @@ def load(cwd):
 def save(cwd, st):
     p = state_path(cwd)
     tmp = p + ".tmp"
-    json.dump(st, open(tmp, "w"), indent=1)
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(st, fh, indent=1)
     os.replace(tmp, p)
 
 
@@ -168,24 +175,37 @@ def out(obj):
     sys.exit(0)
 
 
+def activate(st: dict, sid: str, cwd: str, tp: str, budget: int, plan: dict | None = None) -> str:
+    """Start (or restart) a budgeted session and return the protocol text to inject."""
+    u = usage(tp)
+    st[sid] = {"budget": budget, "base_etok": u["etok"], "phase": "map", "reads": {},
+               "denied_big": [], "warned80": False, "started": time.time(), "phase_at": {},
+               "ecosystem": {"graphify": has_graph(cwd), "ponytail": has_ponytail()},
+               "plan_estimate": (plan or {}).get("estimate_admitted", 0),
+               "plan_items": (plan or {}).get("items", {})}
+    save(cwd, st)
+    eco = st[sid]["ecosystem"]
+    plan_txt = ""
+    if plan:
+        it = plan["items"]
+        plan_txt = PLAN_CTX.format(admitted=", ".join(it["admitted"]) or "none",
+                                   deferred=", ".join(it["deferred"]) or "none",
+                                   est=fmt(plan["estimate_admitted"]), budget=fmt(budget))
+    return PROTOCOL.format(
+        budget=fmt(budget), usd=budget * USD_PER_MTOK / 1e6, big=BIG_FILE_LINES, plan=plan_txt,
+        map_hint=("`graphify query \"<question>\"` first (graph is built)." if eco["graphify"]
+                  else "No graph: use Glob on names only."),
+        ponytail=(" Ponytail rules apply: stdlib first, no speculative code." if eco["ponytail"] else
+                  " Minimal code: stdlib first, no speculative options, no docstrings beyond one line."))
+
+
 def hook_prompt(ev: dict):
     cwd, sid, tp = ev.get("cwd", ""), ev.get("session_id", "x"), ev.get("transcript_path", "")
     st = load(cwd)
     b = parse_budget(ev.get("prompt", ""))
     if b:
-        u = usage(tp)
-        st[sid] = {"budget": b, "base_etok": u["etok"], "phase": "map", "reads": {},
-                   "denied_big": [], "warned80": False, "started": time.time(),
-                   "phase_at": {}, "ecosystem": {"graphify": has_graph(cwd), "ponytail": has_ponytail()}}
-        save(cwd, st)
-        eco = st[sid]["ecosystem"]
-        ctx = PROTOCOL.format(
-            budget=fmt(b), usd=b * USD_PER_MTOK / 1e6, big=BIG_FILE_LINES,
-            map_hint=("`graphify query \"<question>\"` first (graph is built)." if eco["graphify"]
-                      else "No graph: use Glob on names only."),
-            ponytail=(" Ponytail rules apply: stdlib first, no speculative code." if eco["ponytail"] else
-                      " Minimal code: stdlib first, no speculative options, no docstrings beyond one line."))
-        out({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}})
+        out({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                    "additionalContext": activate(st, sid, cwd, tp, b)}})
     sess = st.get(sid)
     if sess:
         s, _ = spent(sess, tp)
@@ -250,10 +270,17 @@ def hook_pretool(ev: dict):
 def hook_posttool(ev: dict):
     cwd, sid, tp = ev.get("cwd", ""), ev.get("session_id", "x"), ev.get("transcript_path", "")
     st = load(cwd)
+    tool, ti = ev.get("tool_name", ""), ev.get("tool_input", {}) or {}
+    pend = os.path.join(os.path.dirname(state_path(cwd)), "pending.json")
+    if tool == "Bash" and re.search(r"tf(-launch\.js|\.py)\S*\s+plan\b", ti.get("command", "")) \
+            and os.path.exists(pend):
+        plan = json.load(open(pend, encoding="utf-8"))
+        os.remove(pend)
+        out({"hookSpecificOutput": {"hookEventName": "PostToolUse",
+             "additionalContext": activate(st, sid, cwd, tp, plan["budget"], plan)}})
     sess = st.get(sid)
     if not sess:
         sys.exit(0)
-    tool, ti = ev.get("tool_name", ""), ev.get("tool_input", {}) or {}
     s, _ = spent(sess, tp)
     # Zero-cost phase inference: first edit -> build, first test run after an edit -> verify.
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
@@ -261,7 +288,7 @@ def hook_posttool(ev: dict):
         sess["reads"] = {k: v for k, v in sess["reads"].items() if not k.startswith(fp + ":")}
         if sess["phase"] == "map":
             sess["phase"], sess["phase_at"]["build"] = "build", s
-    if tool == "Bash" and re.search(r"\b(pytest|tox|nox|unittest)\b", ti.get("command", "")) \
+    if tool == "Bash" and re.search(r"\b(pytest|tox|nox|unittest|run_tests)\b", ti.get("command", "")) \
             and sess["phase"] == "build":
         sess["phase"], sess["phase_at"]["verify"] = "verify", s
     msgs = []
@@ -294,8 +321,88 @@ def hook_stop(ev: dict):
            "elapsed_s": round(time.time() - sess["started"], 1)}
     d = os.path.join(os.path.dirname(state_path(cwd)), "receipts")
     os.makedirs(d, exist_ok=True)
-    json.dump(rec, open(os.path.join(d, f"{sid}.json"), "w"), indent=1)
+    rec["plan_estimate"] = sess.get("plan_estimate", 0)
+    with open(os.path.join(d, f"{sid}.json"), "w", encoding="utf-8") as fh:
+        json.dump(rec, fh, indent=1)
+    root = os.path.dirname(os.path.dirname(state_path(cwd)))
+    if sess.get("plan_estimate") and not sess.get("calibrated"):
+        import tf_plan
+        tf_plan.record_calibration(root, sess["plan_estimate"], s)
+        sess["calibrated"] = True
+        save(cwd, st)
+    write_changelog(root, sess, s, last_assistant_text(tp))
     sys.exit(0)
+
+
+def last_assistant_text(tp: str) -> str:
+    text = ""
+    try:
+        with open(tp, encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if '"assistant"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if o.get("type") != "assistant":
+                    continue
+                parts = [c.get("text", "") for c in (o.get("message") or {}).get("content") or []
+                         if isinstance(c, dict) and c.get("type") == "text"]
+                if any(p.strip() for p in parts):
+                    text = "\n".join(parts).strip()
+    except OSError:
+        pass
+    return text
+
+
+def write_changelog(root: str, sess: dict, spent_etok: int, reply: str):
+    """Append one minimal entry per finished turn: the agent's changelog reply + measured numbers."""
+    import subprocess
+    try:
+        stat = subprocess.run(["git", "diff", "--stat", "HEAD"], cwd=root, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=10).stdout.strip().splitlines()
+        stat = stat[-1].strip() if stat else "no changes"
+    except (OSError, subprocess.SubprocessError):
+        stat = "git unavailable"
+    est = sess.get("plan_estimate") or 0
+    lines = [f"## {time.strftime('%Y-%m-%d %H:%M')}",
+             reply[:1500] or "(no reply text)",
+             f"Spend: {fmt(spent_etok)}/{fmt(sess['budget'])} etok (~${spent_etok * USD_PER_MTOK / 1e6:.2f})"
+             + (f", planned {fmt(est)}" if est else "") + f" | Diff: {stat}", ""]
+    with open(os.path.join(root, ".tokenforward", "CHANGELOG.md"), "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def cmd_plan(argv: list[str]):
+    """tf plan <budget> [<spec.md> | -] [--since <git ref>]   (spec from a file, stdin '-', or changed lines)"""
+    import argparse
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tf_plan
+    ap = argparse.ArgumentParser(prog="tf plan")
+    ap.add_argument("budget")
+    ap.add_argument("spec", nargs="?", default=None)
+    ap.add_argument("--since", default=None)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--dry", action="store_true", help="plan only; do not arm the budget for the session")
+    a = ap.parse_args(argv)
+    budget = parse_budget(f"/tfd {a.budget}") or int(float(a.budget))
+    root = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    spec = sys.stdin.read() if a.spec == "-" else a.spec
+    res = tf_plan.plan(root, budget, spec, a.since)
+    rows = res["rows"]
+    label = lambda i: (re.match(r"\**((?:FR|NFR|SC)-\d+|T\d+|\d+)", rows[i]["item"]) or  # noqa: E731
+                       re.match(r"(.{0,40})", rows[i]["item"])).group(1).strip("*. )")
+    res["items"] = {"admitted": [label(i) for i in res["admitted"]],
+                    "deferred": [label(i) for i in range(len(rows)) if i not in res["admitted"]]}
+    d = os.path.dirname(state_path(root))
+    files = [("plan.json", json.dumps(res, indent=1)), ("plan.md", tf_plan.render(res))]
+    if not a.dry:
+        files.append(("pending.json", json.dumps({k: res[k] for k in ("budget", "estimate_admitted", "items")})))
+    for name, body in files:
+        with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
+            fh.write(body)
+    print(json.dumps(res, indent=1) if a.json else tf_plan.render(res))
 
 
 def statusline():
@@ -316,6 +423,11 @@ def statusline():
 
 
 def main():
+    for stream in (sys.stdin, sys.stdout):
+        try:
+            stream.reconfigure(encoding="utf-8")  # Windows defaults to cp1252
+        except (AttributeError, ValueError):
+            pass
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     hooks = {"hook-prompt": hook_prompt, "hook-pretool": hook_pretool,
              "hook-posttool": hook_posttool, "hook-stop": hook_stop}
@@ -331,6 +443,8 @@ def main():
         except Exception as e:  # a broken hook must never block the user
             eprint(f"tokenforward: {e}")
             sys.exit(0)
+    elif cmd == "plan":
+        cmd_plan(sys.argv[2:])
     elif cmd == "statusline":
         statusline()
     elif cmd == "status":

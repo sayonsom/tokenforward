@@ -172,4 +172,4 @@ def test_async_exhausted_raises():
 def test_docs_page_linked():
     root = os.path.dirname(os.path.dirname(httpx.__file__))
     assert os.path.exists(os.path.join(root, "docs", "advanced", "retries.md"))
-    assert "advanced/retries.md" in open(os.path.join(root, "mkdocs.yml")).read()
+    assert "advanced/retries.md" in open(os.path.join(root, "mkdocs.yml"), encoding="utf-8").read()
