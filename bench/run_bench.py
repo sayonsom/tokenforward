@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Token benchmark on a real brownfield repo (httpx), same ticket, same model, hidden acceptance tests.
+"""Token benchmark on a real brownfield repo (httpx or numpy), same ticket, same model, hidden acceptance tests.
 
 Arms:
   speckit    GitHub Spec Kit, warm: constitution already exists (setup cost excluded),
@@ -10,7 +10,7 @@ Arms:
   vibe       one prompt, no process (optional floor reference)
   --with-ponytail adds ponytail to both tfd arms.
 
-Tickets (bench/tickets/<name>): client_retries (complex, default), retry_transport (small).
+Tickets (bench/tickets/<name>): numpy_average_where (numpy, default), client_retries (httpx, complex), retry_transport (httpx, small).
 
 Usage:
   python bench/run_bench.py --arms speckit,tfd-bare,tfd-graph --model sonnet --budget 400k --runs 1
@@ -35,8 +35,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import tf  # noqa: E402  reuse the exact same token accounting as the plugin
 
-REPO = "https://github.com/encode/httpx.git"
-COMMIT = "b5addb64f0161ff6bfe94c124ef76f6a1fba5254"
+TARGET: dict = {}
 PONYTAIL = "https://github.com/DietrichGebert/ponytail.git"
 TICKET = ""
 ACCEPT_DIR = ""
@@ -44,19 +43,21 @@ ACCEPT_N = 0
 
 
 def load_ticket(name):
-    global TICKET, ACCEPT_DIR, ACCEPT_N
+    global TICKET, ACCEPT_DIR, ACCEPT_N, TARGET
     d = os.path.join(HERE, "tickets", name)
+    TARGET = json.load(open(os.path.join(d, "target.json")))
+    TARGET["ticket_dir"] = d
     TICKET = open(os.path.join(d, "TICKET.md")).read().strip()
     ACCEPT_DIR = os.path.join(d, "acceptance")
     ACCEPT_N = sum(open(f).read().count("\ndef test_") for f in glob.glob(os.path.join(ACCEPT_DIR, "test_*.py")))
 HEADLESS = "\n\nThis is a non-interactive run. Do not ask questions; make reasonable assumptions and finish the work."
 
-SPECKIT_SETUP = "/speckit-constitution Keep changes minimal and consistent with existing httpx conventions. Every feature ships with tests."
+SPECKIT_SETUP = "/speckit-constitution Keep changes minimal and consistent with this project's existing conventions. Every feature ships with tests."
 
 
 def speckit_steps():
     return ["/speckit-specify " + TICKET,
-            "/speckit-plan Python 3.9+, follow the existing httpx client, config and exception patterns.",
+            "/speckit-plan " + TARGET["plan_hint"],
             "/speckit-tasks",
             "/speckit-implement"]
 
@@ -75,25 +76,61 @@ def log(*a):
 
 # ---------------- prepare ----------------
 
-def prepare(work):
-    base = os.path.join(work, "base")
+def wheel_site(py, version):
+    """site-packages dir holding the prebuilt numpy wheel (queried from / so the source tree never shadows it)."""
+    r = sh([py, "-c", "import numpy, os; print(numpy.__version__); print(os.path.dirname(os.path.dirname(numpy.__file__)))"], cwd="/")
+    v, site = r.stdout.split()
+    if v != version:
+        raise SystemExit(f"need numpy=={version} installed in {py}, found {v}")
+    return site
+
+
+def prepare(work, a):
+    base = os.path.join(work, "base-" + TARGET["name"])
     if not os.path.exists(base):
-        log("cloning httpx @", COMMIT[:8])
-        sh(["git", "clone", "-q", REPO, base])
-        sh(["git", "checkout", "-q", COMMIT], cwd=base)
+        log("cloning", TARGET["label"])
+        if "ref" in TARGET:
+            sh(["git", "clone", "-q", "--depth", "1", "--branch", TARGET["ref"], TARGET["repo"], base])
+        else:
+            sh(["git", "clone", "-q", TARGET["repo"], base])
+            sh(["git", "checkout", "-q", TARGET["commit"]], cwd=base)
+        if TARGET["mode"] == "numpy-overlay":
+            site = wheel_site(a.python, TARGET["wheel_version"])
+            src = open(os.path.join(TARGET["ticket_dir"], "run_tests.sh")).read()
+            src = src.replace("__WHEEL_SITE__", site).replace("__PYTHON__", a.python) \
+                     .replace("__NP_VERSION__", TARGET["wheel_version"])
+            open(os.path.join(base, "run_tests.sh"), "w").write(src)
+            os.chmod(os.path.join(base, "run_tests.sh"), 0o755)
+            with open(os.path.join(base, ".git", "info", "exclude"), "a") as f:
+                f.write("\n.numpy-overlay/\n")
+            sh("git add run_tests.sh && git -c user.email=b@b -c user.name=bench commit -qm 'bench env'", cwd=base)
+        sh(["git", "tag", "-f", "bench-base"], cwd=base)
     pt = os.path.join(work, "ponytail")
     if not os.path.exists(pt):
         sh(["git", "clone", "-q", "--depth", "1", PONYTAIL, pt])
     return base, pt
 
 
-def failing(repo, paths, py):
-    env = dict(os.environ, PYTHONPATH=repo)
+def _pytest(cwd, paths, py, env):
     r = sh([py, "-m", "pytest", "-q", "-rfE", "-p", "no:cacheprovider", *paths],
-           cwd=repo, env=env, check=False, timeout=900)
+           cwd=cwd, env=env, check=False, timeout=1800)
     fails = set(re.findall(r"^(?:FAILED|ERROR) (\S+)", r.stdout, re.M))
     m = re.search(r"(\d+) passed", r.stdout)
     return fails, int(m.group(1)) if m else 0, r.stdout[-600:]
+
+
+def failing(repo, paths, py, acceptance=False):
+    """Run pytest against an arm checkout. Returns (failed ids, passed count, tail)."""
+    env = dict(os.environ)
+    if TARGET["mode"] == "numpy-overlay":
+        sh([os.path.join(repo, "run_tests.sh"), "--sync-only"], cwd=repo)
+        ov = os.path.join(repo, ".numpy-overlay")
+        if acceptance:
+            env.update(PYTHONPATH=ov, NP_REPO=repo)
+            return _pytest(TARGET["ticket_dir"], paths, py, env)
+        return _pytest(ov, paths, py, env)
+    env["PYTHONPATH"] = repo
+    return _pytest(repo, paths, py, env)
 
 
 def new_arm_dir(work, base, name):
@@ -175,7 +212,7 @@ def run_arm(arm, work, base, pt, a):
         log(f"[speckit] setup (constitution, excluded) ${setup_cost:.3f}")
     if arm.startswith("tfd") or arm == "speckit-tfd":
         if arm in ("tfd-graph", "speckit-tfd"):
-            sh(["graphify", "extract", ".", "--code-only"], cwd=d)
+            sh(["graphify", "extract", d, "--code-only"], cwd=work)  # outside the tree: numpy source shadows numpy
             sh(["graphify", "claude", "install"], cwd=d, check=False)
         extra = ["--plugin-dir", ROOT]
         env.update(TF_USD_PER_MTOK_IN=str(a.usd_per_mtok), TF_PONYTAIL="0")
@@ -203,13 +240,13 @@ def run_arm(arm, work, base, pt, a):
 
     res = summarize_calls(calls)
     res.update(arm=arm, run=a.run_idx, dir=d, model=a.model, setup_cost_usd=round(setup_cost, 4),
-               ticket=a.ticket, ponytail=bool(a.with_ponytail and arm.startswith("tfd")))
+               ticket=a.ticket, target=TARGET["label"], ponytail=bool(a.with_ponytail and arm.startswith("tfd")))
 
     # Score: hidden acceptance tests, regressions vs baseline, diff size.
-    acc_fail, acc_pass, _ = failing(d, [ACCEPT_DIR], a.python)
+    acc_fail, acc_pass, _ = failing(d, [ACCEPT_DIR], a.python, acceptance=True)
     res["acceptance_pass"], res["acceptance_total"] = min(acc_pass, ACCEPT_N), ACCEPT_N
     if not a.skip_regress:
-        f, _, _ = failing(d, ["tests"], a.python)
+        f, _, _ = failing(d, TARGET["regress"], a.python)
         res["regressions"] = sorted(f - a.baseline_fail)
     sh("git add -A", cwd=d)
     ns = sh(["git", "diff", "--cached", "--numstat", head], cwd=d).stdout
@@ -219,13 +256,15 @@ def run_arm(arm, work, base, pt, a):
         add, _, path = line.split("\t", 2)
         if add == "-":
             continue
+        if path == "run_tests.sh":
+            continue
         if path.startswith(("specs/", ".specify/memory")):
             spec_docs += int(add)
             continue
         if path.startswith((".specify", ".claude", "CLAUDE.md", "graphify-out")):
             continue
         files.append(path)
-        if path.startswith("docs/") or path == "mkdocs.yml":
+        if path.startswith(("docs/", "doc/")) or path == "mkdocs.yml":
             docs += int(add)
         elif "test" in path:
             tests += int(add)
@@ -333,12 +372,12 @@ td,th{{text-align:left;padding:8px;border-bottom:1px solid var(--grid)}} th{{col
 .note{{color:var(--t2);font-size:13px;margin-top:16px}}
 </style></head><body><main>
 <h1>Same brownfield ticket, different workflows</h1>
-<p class="sub">httpx @ {COMMIT[:8]} (~8.8k LOC) · ticket: {rows[0].get("ticket", "") if rows else ""} · model: {model} · median of {max(g["n"] for g in agg.values())} run(s) · Spec Kit setup (constitution) excluded</p>
+<p class="sub">{rows[0].get("target", "") if rows else ""} · ticket: {rows[0].get("ticket", "") if rows else ""} · model: {model} · median of {max(g["n"] for g in agg.values())} run(s) · Spec Kit setup (constitution) excluded</p>
 {head}
 <div class="grid">{cards}</div>
 <table><tr><th>Arm</th><th>Hidden acceptance</th><th>Regressions</th><th>Test LOC</th><th>Docs LOC</th><th>Spec doc lines</th><th>Runs</th></tr>{trs}</table>
 <p class="note">Effective tokens = input + 1.25 x cache write + 0.1 x cache read + 5 x output (input-token equivalents, proportional to USD).
-Cost is the CLI's own total_cost_usd. Acceptance tests were never shown to any arm. Regressions = existing httpx tests that newly fail.</p>
+Cost is the CLI's own total_cost_usd. Acceptance tests were never shown to any arm. Regressions = existing project tests that newly fail.</p>
 </main></body></html>"""
     p = os.path.join(outdir, "report.html")
     open(p, "w").write(html)
@@ -352,7 +391,7 @@ Cost is the CLI's own total_cost_usd. Acceptance tests were never shown to any a
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", default="speckit,tfd-bare,tfd-graph")
-    ap.add_argument("--ticket", default="client_retries")
+    ap.add_argument("--ticket", default="numpy_average_where")
     ap.add_argument("--with-ponytail", action="store_true")
     ap.add_argument("--model", default="sonnet")
     ap.add_argument("--budget", default="400k")
@@ -370,10 +409,10 @@ def main():
     a.arms = a.arms.replace("tfd,", "tfd-graph,").rstrip(",")
 
     os.makedirs(a.work, exist_ok=True)
-    base, pt = prepare(a.work)
+    base, pt = prepare(a.work, a)
     a.baseline_fail = set()
     if not a.skip_regress:
-        a.baseline_fail, n, _ = failing(base, ["tests"], a.python)
+        a.baseline_fail, n, _ = failing(base, TARGET["regress"], a.python)
         log(f"baseline: {n} passed, {len(a.baseline_fail)} pre-existing failures (ignored)")
     outdir = os.path.join(HERE, "results", time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(outdir)
@@ -384,7 +423,7 @@ def main():
             r = run_arm(arm, a.work, base, pt, a)
             rows.append(r)
             log(f"[{arm}] ${r['cost_usd']:.3f} etok={r['etok']:,} accept={r['acceptance_pass']}/{r['acceptance_total']}")
-            json.dump({"ticket": TICKET, "commit": COMMIT, "runs": rows},
+            json.dump({"ticket": TICKET, "target": TARGET, "runs": rows},
                       open(os.path.join(outdir, "results.json"), "w"), indent=1)
     report(outdir)
 

@@ -51,4 +51,4 @@ Env: `TF_ENFORCE=0` (track only), `TF_BIG_FILE_LINES=300`. `python3 scripts/tf.p
 
 ## Benchmark
 
-`bench/` runs Spec Kit (warm) vs TokenForward vs TokenForward + graphify (plus optional Spec Kit + TokenForward, vibe) on a complex httpx ticket with 18 hidden acceptance tests. See `CLASS.md`.
+`bench/` runs Spec Kit (warm) vs TokenForward vs TokenForward + graphify (plus optional Spec Kit + TokenForward, vibe) on a real numpy feature (`where=` for `np.average`, 18 hidden acceptance tests; numpy is tested against the prebuilt wheel, no compile) or two httpx tickets. See `CLASS.md`.

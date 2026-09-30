@@ -1,0 +1,3 @@
+{"name": "httpx", "label": "httpx @ b5addb64 (~8.8k Python LOC)", "repo": "https://github.com/encode/httpx.git",
+ "commit": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254", "mode": "pythonpath", "regress": ["tests"],
+ "plan_hint": "Python 3.9+, follow the existing httpx client, config and exception patterns."}

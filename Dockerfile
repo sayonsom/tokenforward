@@ -1,7 +1,7 @@
 # Clean, isolated benchmark box: no global plugins leak into the vibe/speckit arms.
 # Build:  docker build -t tokenforward-bench .
 # Run:    docker run --rm -e ANTHROPIC_API_KEY -v "$PWD/bench/results:/app/bench/results" tokenforward-bench \
-#           --arms vibe,speckit,tfd --model sonnet --budget 250k
+#           --ticket numpy_average_where --arms speckit,tfd-bare,tfd-graph --model sonnet --budget 400k
 # (Claude subscription instead of API key: run `claude setup-token` on the host, pass -e CLAUDE_CODE_OAUTH_TOKEN)
 FROM node:22-bookworm
 
@@ -20,7 +20,8 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 RUN git clone -q https://github.com/encode/httpx.git /home/bench/httpx-src \
  && cd /home/bench/httpx-src && git checkout -q b5addb64f0161ff6bfe94c124ef76f6a1fba5254 \
  && uv venv -q /home/bench/venv \
- && VIRTUAL_ENV=/home/bench/venv uv pip install -q -r requirements.txt
+ && VIRTUAL_ENV=/home/bench/venv uv pip install -q -r requirements.txt \
+ && VIRTUAL_ENV=/home/bench/venv uv pip install -q numpy==2.4.6 hypothesis
 
 WORKDIR /app
 COPY --chown=bench . /app

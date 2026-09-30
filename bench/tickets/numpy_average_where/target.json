@@ -1,0 +1,4 @@
+{"name": "numpy", "label": "numpy v2.4.6 (~272k Python + ~384k C LOC)", "repo": "https://github.com/numpy/numpy.git",
+ "ref": "v2.4.6", "mode": "numpy-overlay", "wheel_version": "2.4.6",
+ "regress": ["numpy/lib/tests/test_function_base.py", "numpy/ma/tests/test_extras.py"],
+ "plan_hint": "Pure Python and .pyi changes only; follow existing numpy conventions for dispatchers, stubs, docstrings and release notes."}

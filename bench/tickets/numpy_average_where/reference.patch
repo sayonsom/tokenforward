@@ -1,0 +1,332 @@
+diff --git a/doc/release/upcoming_changes/30000.new_feature.rst b/doc/release/upcoming_changes/30000.new_feature.rst
+new file mode 100644
+index 0000000..ff0fed0
+--- /dev/null
++++ b/doc/release/upcoming_changes/30000.new_feature.rst
+@@ -0,0 +1,3 @@
++``where`` parameter for ``np.average``
++--------------------------------------
++``np.average`` and ``np.ma.average`` now accept ``where=``, matching ``np.mean``.
+diff --git a/numpy/lib/_function_base_impl.py b/numpy/lib/_function_base_impl.py
+index 6d77cf3..846eaaf 100644
+--- a/numpy/lib/_function_base_impl.py
++++ b/numpy/lib/_function_base_impl.py
+@@ -432,13 +432,13 @@ def _weights_are_valid(weights, a, axis):
+ 
+ 
+ def _average_dispatcher(a, axis=None, weights=None, returned=None, *,
+-                        keepdims=None):
+-    return (a, weights)
++                        keepdims=None, where=None):
++    return (a, weights, where)
+ 
+ 
+ @array_function_dispatch(_average_dispatcher)
+ def average(a, axis=None, weights=None, returned=False, *,
+-            keepdims=np._NoValue):
++            keepdims=np._NoValue, where=np._NoValue):
+     """
+     Compute the weighted average along the specified axis.
+ 
+@@ -483,6 +483,12 @@ def average(a, axis=None, weights=None, returned=False, *,
+ 
+         .. versionadded:: 1.23.0
+ 
++    where : array_like of bool, optional
++        Elements to include in the average. Excluded elements contribute
++        neither value nor weight. See `~numpy.ufunc.reduce` for details.
++
++        .. versionadded:: 2.5.0
++
+     Returns
+     -------
+     retval, [sum_of_weights] : array_type or double
+@@ -572,12 +578,27 @@ def average(a, axis=None, weights=None, returned=False, *,
+     else:
+         keepdims_kw = {'keepdims': keepdims}
+ 
++    if where is np._NoValue:
++        where_kw = {}
++    else:
++        where = np.broadcast_to(np.asanyarray(where, dtype=bool), a.shape)
++        where_kw = {'where': where}
++
+     if weights is None:
+-        avg = a.mean(axis, **keepdims_kw)
++        avg = a.mean(axis, **keepdims_kw, **where_kw)
+         avg_as_array = np.asanyarray(avg)
+-        scl = avg_as_array.dtype.type(a.size / avg_as_array.size)
++        if where is np._NoValue:
++            scl = avg_as_array.dtype.type(a.size / avg_as_array.size)
++        else:
++            scl = np.asanyarray(
++                where.sum(axis=axis, **keepdims_kw)
++            ).astype(avg_as_array.dtype)
++            if scl.ndim == 0:
++                scl = scl[()]
+     else:
+         wgt = _weights_are_valid(weights=weights, a=a, axis=axis)
++        if where is not np._NoValue:
++            wgt = np.where(where, np.broadcast_to(wgt, a.shape), 0)
+ 
+         if issubclass(a.dtype.type, (np.integer, np.bool)):
+             result_dtype = np.result_type(a.dtype, wgt.dtype, 'f8')
+@@ -589,8 +610,8 @@ def average(a, axis=None, weights=None, returned=False, *,
+             raise ZeroDivisionError(
+                 "Weights sum to zero, can't be normalized")
+ 
+-        avg = avg_as_array = np.multiply(a, wgt,
+-                          dtype=result_dtype).sum(axis, **keepdims_kw) / scl
++        avg = avg_as_array = np.multiply(a, wgt, dtype=result_dtype).sum(
++            axis, **keepdims_kw, **where_kw) / scl
+ 
+     if returned:
+         if scl.shape != avg_as_array.shape:
+diff --git a/numpy/lib/_function_base_impl.pyi b/numpy/lib/_function_base_impl.pyi
+index 8bcdf98..a64b481 100644
+--- a/numpy/lib/_function_base_impl.pyi
++++ b/numpy/lib/_function_base_impl.pyi
+@@ -242,6 +242,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[True],
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _ArrayInexactT: ...
+ @overload  # inexact array, returned=True keepdims=True
+ def average(
+@@ -251,6 +252,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[True],
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[_ArrayInexactT]: ...
+ @overload  # inexact array-like, axis=None
+ def average(
+@@ -260,6 +262,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _InexactT: ...
+ @overload  # inexact array-like, axis=<given>
+ def average(
+@@ -269,6 +272,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> NDArray[_InexactT]: ...
+ @overload  # inexact array-like, keepdims=True
+ def average(
+@@ -278,6 +282,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[True],
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> NDArray[_InexactT]: ...
+ @overload  # inexact array-like, axis=None, returned=True
+ def average(
+@@ -287,6 +292,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[_InexactT]: ...
+ @overload  # inexact array-like, axis=<given>, returned=True
+ def average(
+@@ -296,6 +302,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[NDArray[_InexactT]]: ...
+ @overload  # inexact array-like, returned=True, keepdims=True
+ def average(
+@@ -305,6 +312,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[True],
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[NDArray[_InexactT]]: ...
+ @overload  # bool or integer array-like, axis=None
+ def average(
+@@ -314,6 +322,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> np.float64: ...
+ @overload  # bool or integer array-like, axis=<given>
+ def average(
+@@ -323,6 +332,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> NDArray[np.float64]: ...
+ @overload  # bool or integer array-like, keepdims=True
+ def average(
+@@ -332,6 +342,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[True],
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> NDArray[np.float64]: ...
+ @overload  # bool or integer array-like, axis=None, returned=True
+ def average(
+@@ -341,6 +352,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[np.float64]: ...
+ @overload  # bool or integer array-like, axis=<given>, returned=True
+ def average(
+@@ -350,6 +362,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[NDArray[np.float64]]: ...
+ @overload  # bool or integer array-like, returned=True, keepdims=True
+ def average(
+@@ -359,6 +372,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[True],
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[NDArray[np.float64]]: ...
+ @overload  # complex array-like, axis=None
+ def average(
+@@ -368,6 +382,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> np.complex128: ...
+ @overload  # complex array-like, axis=<given>
+ def average(
+@@ -377,6 +392,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> NDArray[np.complex128]: ...
+ @overload  # complex array-like, keepdims=True
+ def average(
+@@ -386,6 +402,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[True],
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> NDArray[np.complex128]: ...
+ @overload  # complex array-like, axis=None, returned=True
+ def average(
+@@ -395,6 +412,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[np.complex128]: ...
+ @overload  # complex array-like, axis=<given>, returned=True
+ def average(
+@@ -404,6 +422,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[NDArray[np.complex128]]: ...
+ @overload  # complex array-like, keepdims=True, returned=True
+ def average(
+@@ -413,6 +432,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[True],
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[NDArray[np.complex128]]: ...
+ @overload  # unknown, axis=None
+ def average(
+@@ -422,6 +442,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> Any: ...
+ @overload  # unknown, axis=<given>
+ def average(
+@@ -431,6 +452,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> np.ndarray: ...
+ @overload  # unknown, keepdims=True
+ def average(
+@@ -440,6 +462,7 @@ def average(
+     returned: L[False] = False,
+     *,
+     keepdims: L[True],
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> np.ndarray: ...
+ @overload  # unknown, axis=None, returned=True
+ def average(
+@@ -449,6 +472,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[Any]: ...
+ @overload  # unknown, axis=<given>, returned=True
+ def average(
+@@ -458,6 +482,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[False] | _NoValueType = ...,
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[np.ndarray]: ...
+ @overload  # unknown, returned=True, keepdims=True
+ def average(
+@@ -467,6 +492,7 @@ def average(
+     *,
+     returned: L[True],
+     keepdims: L[True],
++    where: _ArrayLikeBool_co | _NoValueType = ...,
+ ) -> _Tuple2[np.ndarray]: ...
+ 
+ #
+diff --git a/numpy/ma/extras.py b/numpy/ma/extras.py
+index 7387d4f..a161653 100644
+--- a/numpy/ma/extras.py
++++ b/numpy/ma/extras.py
+@@ -508,7 +508,7 @@ def apply_over_axes(func, a, axes):
+ 
+ 
+ def average(a, axis=None, weights=None, returned=False, *,
+-            keepdims=np._NoValue):
++            keepdims=np._NoValue, where=np._NoValue):
+     """
+     Return the weighted average of array over the given axis.
+ 
+@@ -551,6 +551,12 @@ def average(a, axis=None, weights=None, returned=False, *,
+ 
+         .. versionadded:: 1.23.0
+ 
++    where : array_like of bool, optional
++        Elements to include in the average. Excluded elements contribute
++        neither value nor weight. See `~numpy.ufunc.reduce` for details.
++
++        .. versionadded:: 2.5.0
++
+     Returns
+     -------
+     average, [sum_of_weights] : (tuple of) scalar or MaskedArray
+@@ -621,6 +627,9 @@ def average(a, axis=None, weights=None, returned=False, *,
+       fill_value=1e+20)
+     """
+     a = asarray(a)
++    if where is not np._NoValue:
++        excluded = ~np.broadcast_to(np.asarray(where, dtype=bool), a.shape)
++        a = array(a, mask=getmaskarray(a) | excluded)
+     m = getmask(a)
+ 
+     if axis is not None:
