@@ -1,53 +1,70 @@
 # Token-Optimised Brownfield Development: 30-minute class
 
-Audience: senior engineers, $30/month API credits, told to do SDD, pushing back that it wastes tokens.
-Thesis: they are right about the verbosity and wrong about the spec. Cost in an agent loop is sum over turns of context size. Cut turns, cut context, keep the spec executable.
+Audience: senior engineers, $30/month API credits, already on Spec Kit, saying it burns tokens.
+Claim to prove: on a complex brownfield ticket, TokenForward cuts effective tokens by X% vs their Spec Kit workflow, graphify adds Y% on top, with the same hidden acceptance tests passing.
+X and Y come from your pre-class run. Do not quote numbers you have not measured.
 
-## Before class (do tonight / this morning)
+## The demo task
 
-1. Push this folder to GitHub (`<you>/tokenforward`) so students can `/plugin marketplace add` it.
-2. Run the benchmark once, keep the report on screen. Cheap dry run first:
+Repo: httpx @ b5addb64 (~8.8k LOC, `_client.py` = 2,019 lines). Ticket: `bench/tickets/client_retries/TICKET.md`.
+First-class client retries: new `httpx.Retry` config, `Client(retries=)` + `AsyncClient(retries=)`, per-request override via extensions, per-hop retry inside the send path (redirects, event hooks), new `RetryError` in the exception hierarchy, `response.extensions["retries"]`, sorted `__all__`, docs page + mkdocs nav.
+Why it is a Spec Kit-class ticket: 6 files across config, client (sync + async), exceptions, exports, docs; hidden brownfield conventions (httpx has a test that `__all__` stays sorted).
+Scoring: 18 hidden acceptance tests + full existing suite for regressions. Reference solution passes 18/18 with 0 regressions; unmodified httpx fails 18/18.
+
+## Arms
+
+| Arm | What it is | Why it is in the room |
+|---|---|---|
+| `speckit` | Spec Kit, warm: constitution already written (cost excluded), then specify, plan, tasks, implement | Their current workflow. The 100% baseline |
+| `tfd-bare` | TokenForward alone | Isolates the plugin |
+| `tfd-graph` | TokenForward + graphify (AST graph, 3 s, 0 tokens) | The headline |
+| `speckit-tfd` | Spec Kit with TokenForward + graphify loaded | "Keep your process, cut the spend" |
+| `vibe` | One prompt | Optional floor reference |
+
+Ponytail: `--with-ponytail` adds it to the TokenForward arms. Keep it off for the headline so the percentage belongs to TokenForward and graphify alone; run it as a second report if time allows.
+
+## Before class
+
+1. Push this folder to GitHub (`<you>/tokenforward`).
+2. Smoke test (cheap): `python bench/run_bench.py --arms tfd-graph --model haiku --skip-regress`
+3. Real run (the numbers for the slide):
    ```
-   python bench/run_bench.py --arms tfd --model haiku --skip-regress      # smoke test, cents
-   python bench/run_bench.py --arms vibe,speckit,tfd --model sonnet       # the real one
+   python bench/run_bench.py --arms speckit,tfd-bare,tfd-graph,speckit-tfd --model sonnet --budget 400k
    ```
-   Or in Docker (clean HOME, no global plugins leaking into the baseline arms): see `Dockerfile` header.
-   Output: `bench/results/<stamp>/report.html` + `results.json`. Screenshot both for proof.
-3. Local demo repo: `git clone https://github.com/encode/httpx && cd httpx && git checkout b5addb64`
-   `graphify extract . --code-only && graphify claude install` (3 s, 0 tokens). Install ponytail + tokenforward. Statusline on.
-4. Have a second terminal with `tail -f` nothing; just `cat .tokenforward/receipts/*.json` ready.
+   Check `total_cost_usd` in the log after the first arm and stop if it is running away. `--runs 3` for medians if you have the budget.
+   Output: `bench/results/<stamp>/report.html`. KPI tiles at the top: % fewer effective tokens vs Spec Kit for each TokenForward arm, and graphify's marginal %. Screenshot it.
+4. If TokenForward fails acceptance because the budget blocked it, raise `--budget` and rerun. Report the budget you used.
+5. Live demo repo: fresh httpx at b5addb64 with `graphify extract . --code-only && graphify claude install`, TokenForward installed, statusline on.
 
 ## Run of show
 
-| Min | Segment | What you do on screen |
+| Min | Segment | On screen |
 |---|---|---|
-| 0-3 | The bill | One slide or whiteboard: turn 1 context 20k, turn 30 context 80k. Cost = area under that curve. Output is a sliver. "Your $30 is a context-size problem." |
-| 3-8 | Four leaks in brownfield | 1. Whole-file reads re-paid every turn (httpx `_client.py` = 2,019 lines, ~24k tokens, every turn after). 2. Process verbosity: Spec Kit ships ~19k words of skill instructions plus spec/plan/tasks docs. 3. Turn count: narration, serial tool calls. 4. Code volume: unrequested abstractions. Map each leak to a tool: graphify, TokenForward spec card, batching + budget, ponytail. |
-| 8-12 | graphify live | `graphify query "where are transports defined and exported"` on httpx. Point: 3-second AST build, zero LLM tokens, answer names `_transports/__init__.py`, `httpx/__init__.py`, `test_exported_members.py` without reading a file. |
-| 12-22 | TokenForward live | In httpx: `/tfd 250k` + paste `bench/TICKET.md`. Narrate the statusline. Expect: spec card (8 lines), a denied whole-file read with the reason visible, phase flip map -> build on first edit, build -> verify on first pytest, receipt at the end. If it goes long, let it run and move on. |
-| 22-27 | The benchmark | Open `report.html`. Same ticket, same model, hidden acceptance tests. Read three numbers: cost, turns, acceptance. Point at the regressions column: httpx has a test that `__all__` stays sorted; brownfield punishes agents that do not look at conventions. |
-| 27-30 | Adoption | Install lines on screen. One rule to take home: "State the budget before the task. Make the spec a failing test." |
+| 0-3 | The bill | Cost = sum over turns of context size. Turn 1 at 20k, turn 40 at 90k. Output is a sliver. |
+| 3-7 | Where Spec Kit spends | Spec Kit installs ~19k words of skill instructions. Each phase is a fresh load plus generated docs (spec, plan, tasks) that later phases read back. Show `specs/` from the pre-run: line count vs code lines. |
+| 7-10 | graphify | `graphify query "where does the client send a single request and where are exceptions exported"`. Names `_send_single_request`, `_exceptions.py`, `__init__.py` without reading `_client.py`. |
+| 10-20 | TokenForward live | `/tfd 400k` + paste the ticket. Narrate: spec card, a denied whole-file read of `_client.py` with the reason, ranged reads, phase flips on first edit and first pytest. You will not finish in 10 minutes; stop at verify and move on. |
+| 20-26 | The numbers | Open `report.html`. Read the tiles: X% vs Spec Kit, Y% from graphify, acceptance per arm, regressions column. Then `speckit-tfd`: they keep Spec Kit and still save. |
+| 26-30 | Adoption | Install lines. One rule: state the budget before the task; make the spec a failing test. |
 
-## Talking points for pushback
+## Pushback answers
 
-- "SDD is overkill": keep the discipline, drop the documents. The card is 8 lines; the tests are the spec and they terminate the loop.
-- "Budgets make the agent stop early": the reserve is 10%, finish mode starts at 80%, and the receipt tells you whether the budget or the task was wrong. Tune once per repo.
-- "Graphs go stale": `graphify hook install` rebuilds on commit, AST only, no cost.
-- "n=1": correct. Say it first. `--runs 3` for medians; ponytail's own benchmark is the precedent for publishing flops too.
+- "Different arms got lucky": same ticket, same model, same hidden tests. n=1 is noted on the report; run `--runs 3`.
+- "You excluded Spec Kit's setup": yes, deliberately, in its favour. Their constitution already exists.
+- "Budget made it stop early": acceptance column shows it. If it failed, the report shows that too.
+- "Graph goes stale": `graphify hook install` rebuilds on commit, AST only.
 
 ## Fallbacks
 
-- No network / API trouble: show the pre-run report and the receipt JSON.
-- Hook not firing: `claude --debug` shows hook execution; `python3 scripts/tf.py status` in the repo shows state.
-- Budget blocks too early: `python3 scripts/tf.py off`, rerun with a larger number.
+- Live run slow or API trouble: show the pre-run report and one arm's receipt (`bench/work/tfd-graph-r0/.tokenforward/receipts/*.json`).
+- Hook not firing: `claude --debug`; `python3 scripts/tf.py status` in the repo.
+- Smaller ticket for a fully live A/B: `--ticket retry_transport` (9 acceptance tests, single new file).
 
-## Student hands-on (if time, or as homework)
+## Student hands-on
 
 ```
 /plugin marketplace add <you>/tokenforward
 /plugin install tokenforward@tokenforward
-/plugin marketplace add DietrichGebert/ponytail
-/plugin install ponytail@ponytail
 uv tool install graphifyy && graphify extract . --code-only && graphify claude install
 ```
-Then on their own repo: `/tfd 150k <a ticket from their backlog>` and share the receipt.
+Then `/tfd 150k <a real ticket from their backlog>` and share the receipt.

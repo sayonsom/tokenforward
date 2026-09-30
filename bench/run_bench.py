@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Three-arm token benchmark on a real brownfield repo (httpx).
+"""Token benchmark on a real brownfield repo (httpx), same ticket, same model, hidden acceptance tests.
 
-Arms (same ticket, same model, same hidden acceptance tests):
-  vibe     one prompt, no process
-  speckit  GitHub Spec Kit: constitution -> specify -> plan -> tasks -> implement
-  tfd      TokenForward + graphify (AST graph, 0 LLM tokens) + ponytail
+Arms:
+  speckit    GitHub Spec Kit, warm: constitution already exists (setup cost excluded),
+             then specify -> plan -> tasks -> implement. The baseline most teams use.
+  tfd-bare   TokenForward alone (no graph)
+  tfd-graph  TokenForward + graphify (AST graph, 0 LLM tokens to build)
+  speckit-tfd  Spec Kit (warm) with TokenForward + graphify loaded: keep your process, cut the spend
+  vibe       one prompt, no process (optional floor reference)
+  --with-ponytail adds ponytail to both tfd arms.
+
+Tickets (bench/tickets/<name>): client_retries (complex, default), retry_transport (small).
 
 Usage:
-  python bench/run_bench.py --arms vibe,speckit,tfd --model sonnet --budget 250k --runs 1
+  python bench/run_bench.py --arms speckit,tfd-bare,tfd-graph --model sonnet --budget 400k --runs 1
   python bench/run_bench.py --report-only bench/results/<stamp>
 Needs: claude CLI authenticated (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN), git,
 specify (spec-kit), graphify (graphifyy). Run inside the Docker image for clean isolation.
@@ -32,17 +38,27 @@ import tf  # noqa: E402  reuse the exact same token accounting as the plugin
 REPO = "https://github.com/encode/httpx.git"
 COMMIT = "b5addb64f0161ff6bfe94c124ef76f6a1fba5254"
 PONYTAIL = "https://github.com/DietrichGebert/ponytail.git"
-TICKET = open(os.path.join(HERE, "TICKET.md")).read().strip()
-ACCEPT_N = open(os.path.join(HERE, "acceptance", "test_retry_acceptance.py")).read().count("\ndef test_")
+TICKET = ""
+ACCEPT_DIR = ""
+ACCEPT_N = 0
+
+
+def load_ticket(name):
+    global TICKET, ACCEPT_DIR, ACCEPT_N
+    d = os.path.join(HERE, "tickets", name)
+    TICKET = open(os.path.join(d, "TICKET.md")).read().strip()
+    ACCEPT_DIR = os.path.join(d, "acceptance")
+    ACCEPT_N = sum(open(f).read().count("\ndef test_") for f in glob.glob(os.path.join(ACCEPT_DIR, "test_*.py")))
 HEADLESS = "\n\nThis is a non-interactive run. Do not ask questions; make reasonable assumptions and finish the work."
 
-SPECKIT_STEPS = [
-    "/speckit-constitution Keep changes minimal and consistent with existing httpx conventions. Every feature ships with tests.",
-    "/speckit-specify " + TICKET,
-    "/speckit-plan Python 3.9+, stdlib only, follow the existing httpx transport patterns.",
-    "/speckit-tasks",
-    "/speckit-implement",
-]
+SPECKIT_SETUP = "/speckit-constitution Keep changes minimal and consistent with existing httpx conventions. Every feature ships with tests."
+
+
+def speckit_steps():
+    return ["/speckit-specify " + TICKET,
+            "/speckit-plan Python 3.9+, follow the existing httpx client, config and exception patterns.",
+            "/speckit-tasks",
+            "/speckit-implement"]
 
 
 def sh(cmd, cwd=None, env=None, timeout=None, check=True):
@@ -150,43 +166,54 @@ def summarize_calls(calls):
 def run_arm(arm, work, base, pt, a):
     d = new_arm_dir(work, base, f"{arm}-r{a.run_idx}")
     extra, env = [], dict(os.environ)
-    if arm == "speckit":
+    setup_cost = 0.0
+    if arm.startswith("speckit"):
+        # Warm Spec Kit: the team already initialised it and wrote a constitution. Not counted.
         sh(["specify", "init", "--here", "--force", "--non-interactive",
             "--integration", "claude", "--script", "sh"], cwd=d)
-    if arm == "tfd":
-        sh(["graphify", "extract", ".", "--code-only"], cwd=d)
-        sh(["graphify", "claude", "install"], cwd=d, check=False)
-        extra = ["--plugin-dir", ROOT, "--plugin-dir", pt]
-        env.update(TF_PONYTAIL="1", TF_USD_PER_MTOK_IN=str(a.usd_per_mtok))
+        setup_cost = claude(SPECKIT_SETUP + HEADLESS, d, a.model).get("total_cost_usd") or 0
+        log(f"[speckit] setup (constitution, excluded) ${setup_cost:.3f}")
+    if arm.startswith("tfd") or arm == "speckit-tfd":
+        if arm in ("tfd-graph", "speckit-tfd"):
+            sh(["graphify", "extract", ".", "--code-only"], cwd=d)
+            sh(["graphify", "claude", "install"], cwd=d, check=False)
+        extra = ["--plugin-dir", ROOT]
+        env.update(TF_USD_PER_MTOK_IN=str(a.usd_per_mtok), TF_PONYTAIL="0")
+        if a.with_ponytail:
+            extra += ["--plugin-dir", pt]
+            env["TF_PONYTAIL"] = "1"
     head = commit_scaffold(d, f"{arm} scaffold")
 
     log(f"[{arm}] running in {d}")
     calls = []
     if arm == "vibe":
         calls.append(claude(TICKET + HEADLESS, d, a.model))
-    elif arm == "speckit":
+    elif arm.startswith("speckit"):
         sid = None
-        for step in SPECKIT_STEPS:
-            j = claude(step + HEADLESS, d, a.model, resume=sid)
+        for n, step in enumerate(speckit_steps()):
+            if arm == "speckit-tfd" and n == 0:
+                step = f"Budget: max {a.budget} tokens.\n\n" + step
+            j = claude(step + HEADLESS, d, a.model, resume=sid, extra=extra, env=env)
             calls.append(j)
             sid = j.get("session_id") or sid
-            log(f"[speckit] {step.split()[0]} ${j.get('total_cost_usd', 0):.3f} turns={j.get('num_turns')}")
-    elif arm == "tfd":
+            log(f"[{arm}] {step.split()[0]} ${j.get('total_cost_usd', 0):.3f} turns={j.get('num_turns')}")
+    elif arm.startswith("tfd"):
         prompt = (f"/tokenforward:tfd {a.budget} " if a.tfd_slash else f"Budget: max {a.budget} tokens.\n\n") + TICKET
         calls.append(claude(prompt + HEADLESS, d, a.model, extra=extra, env=env))
 
     res = summarize_calls(calls)
-    res.update(arm=arm, run=a.run_idx, dir=d, model=a.model)
+    res.update(arm=arm, run=a.run_idx, dir=d, model=a.model, setup_cost_usd=round(setup_cost, 4),
+               ticket=a.ticket, ponytail=bool(a.with_ponytail and arm.startswith("tfd")))
 
     # Score: hidden acceptance tests, regressions vs baseline, diff size.
-    acc_fail, acc_pass, _ = failing(d, [os.path.join(HERE, "acceptance")], a.python)
+    acc_fail, acc_pass, _ = failing(d, [ACCEPT_DIR], a.python)
     res["acceptance_pass"], res["acceptance_total"] = min(acc_pass, ACCEPT_N), ACCEPT_N
     if not a.skip_regress:
         f, _, _ = failing(d, ["tests"], a.python)
         res["regressions"] = sorted(f - a.baseline_fail)
     sh("git add -A", cwd=d)
     ns = sh(["git", "diff", "--cached", "--numstat", head], cwd=d).stdout
-    src = tests = spec_docs = 0
+    src = tests = spec_docs = docs = 0
     files = []
     for line in ns.splitlines():
         add, _, path = line.split("\t", 2)
@@ -198,11 +225,13 @@ def run_arm(arm, work, base, pt, a):
         if path.startswith((".specify", ".claude", "CLAUDE.md", "graphify-out")):
             continue
         files.append(path)
-        if "test" in path:
+        if path.startswith("docs/") or path == "mkdocs.yml":
+            docs += int(add)
+        elif "test" in path:
             tests += int(add)
         else:
             src += int(add)
-    res.update(loc_src=src, loc_tests=tests, spec_doc_lines=spec_docs, files_changed=files)
+    res.update(loc_src=src, loc_tests=tests, loc_docs=docs, spec_doc_lines=spec_docs, files_changed=files)
     receipts = glob.glob(os.path.join(d, ".tokenforward", "receipts", "*.json"))
     if receipts:
         res["tf_receipt"] = json.load(open(receipts[0]))
@@ -213,10 +242,12 @@ def run_arm(arm, work, base, pt, a):
 # ---------------- report ----------------
 
 LIGHT = dict(bg="#FFFFFF", panel="#F5F7FA", grid="#E5E7EB", axis="#D1D5DB", t1="#111827", t2="#4B5563",
-             s=["#7A2E2E", "#C69214", "#003A8F"])
+             s=["#6B7280", "#C69214", "#2F7F9D", "#5B7FA6", "#003A8F"])
 DARK = dict(bg="#0B1220", panel="#111827", grid="#1F2933", axis="#374151", t1="#E5E7EB", t2="#9CA3AF",
-            s=["#C26D6D", "#E0B84C", "#4F83CC"])
-ARM_LABEL = {"vibe": "Vibe coding", "speckit": "Spec Kit SDD", "tfd": "TokenForward + graphify + ponytail"}
+            s=["#9CA3AF", "#E0B84C", "#2F7F9D", "#5B7FA6", "#4F83CC"])
+ARM_ORDER = ("vibe", "speckit", "speckit-tfd", "tfd-bare", "tfd-graph")
+ARM_LABEL = {"vibe": "Vibe coding", "speckit": "Spec Kit (warm)", "tfd-bare": "TokenForward",
+             "tfd-graph": "TokenForward + graphify", "speckit-tfd": "Spec Kit + TokenForward + graphify"}
 
 
 def aggregate(rows):
@@ -228,7 +259,7 @@ def aggregate(rows):
         med = lambda k: sorted(x.get(k, 0) or 0 for x in rs)[len(rs) // 2]  # noqa: E731
         agg[arm] = {k: med(k) for k in ("cost_usd", "etok", "total_tokens", "turns", "wall_s",
                                           "loc_src", "loc_tests", "acceptance_pass", "acceptance_total",
-                                          "cache_read", "output", "spec_doc_lines")}
+                                          "cache_read", "output", "spec_doc_lines", "loc_docs")}
         agg[arm]["regressions"] = max(len(x.get("regressions", [])) for x in rs)
         agg[arm]["n"] = len(rs)
     return agg
@@ -237,7 +268,7 @@ def aggregate(rows):
 def report(outdir):
     rows = json.load(open(os.path.join(outdir, "results.json")))["runs"]
     agg = aggregate(rows)
-    arms = [a for a in ("vibe", "speckit", "tfd") if a in agg]
+    arms = [a for a in ARM_ORDER if a in agg]
     metrics = [("cost_usd", "Cost (USD)", "${:.2f}"), ("etok", "Effective tokens", "{:,.0f}"),
                ("total_tokens", "Raw tokens incl. cache reads", "{:,.0f}"), ("turns", "Agent turns", "{:.0f}"),
                ("wall_s", "Wall time (s)", "{:.0f}"), ("loc_src", "Source LOC added", "{:.0f}")]
@@ -248,26 +279,37 @@ def report(outdir):
         out = []
         for i, a in enumerate(arms):
             w = 100 * vals[i] / mx
+            c = ARM_ORDER.index(a)
             out.append(f'<div class="row"><span class="lbl">{ARM_LABEL[a]}</span>'
-                       f'<span class="track"><span class="bar s{i}" style="width:{w:.1f}%"></span></span>'
+                       f'<span class="track"><span class="bar s{c}" style="width:{w:.1f}%"></span></span>'
                        f'<span class="val">{fmtspec.format(vals[i])}</span></div>')
         return "".join(out)
 
     cards = "".join(f'<section class="card"><h3>{title}</h3>{bars(k, f)}</section>' for k, title, f in metrics)
     head = ""
-    if "vibe" in agg and "tfd" in agg and agg["tfd"]["cost_usd"]:
-        x_v = agg["vibe"]["cost_usd"] / agg["tfd"]["cost_usd"]
-        x_s = agg.get("speckit", {}).get("cost_usd", 0) / agg["tfd"]["cost_usd"]
-        head = (f"<p class='lead'>TokenForward cost {x_v:.1f}x less than vibe coding"
-                + (f" and {x_s:.1f}x less than Spec Kit" if x_s else "") + " on the same ticket.</p>")
+    if "speckit" in agg and agg["speckit"]["etok"]:
+        sk = agg["speckit"]
+        tiles = []
+        for a in ("speckit-tfd", "tfd-bare", "tfd-graph"):
+            if a in agg:
+                red_e = 100 * (1 - agg[a]["etok"] / sk["etok"])
+                red_c = 100 * (1 - agg[a]["cost_usd"] / sk["cost_usd"]) if sk["cost_usd"] else 0
+                tiles.append(f'<div class="kpi"><div class="kv">{red_e:.0f}%</div><div class="kl">fewer effective tokens '
+                             f'than Spec Kit<br>{ARM_LABEL[a]} · cost {red_c:.0f}% lower · '
+                             f'{agg[a]["acceptance_pass"]}/{agg[a]["acceptance_total"]} acceptance</div></div>')
+        if "tfd-bare" in agg and "tfd-graph" in agg and agg["tfd-bare"]["etok"]:
+            g = 100 * (1 - agg["tfd-graph"]["etok"] / agg["tfd-bare"]["etok"])
+            tiles.append(f'<div class="kpi"><div class="kv">{g:.0f}%</div><div class="kl">additional reduction '
+                         f'from graphify<br>TokenForward + graphify vs TokenForward alone</div></div>')
+        head = f'<div class="kpis">{"".join(tiles)}</div>'
     trs = "".join(
         f"<tr><td>{ARM_LABEL[a]}</td><td>{agg[a]['acceptance_pass']}/{agg[a]['acceptance_total']}</td>"
-        f"<td>{agg[a]['regressions']}</td><td>{agg[a]['loc_tests']}</td><td>{agg[a]['spec_doc_lines']}</td><td>{agg[a]['n']}</td></tr>" for a in arms)
+        f"<td>{agg[a]['regressions']}</td><td>{agg[a]['loc_tests']}</td><td>{agg[a]['loc_docs']}</td><td>{agg[a]['spec_doc_lines']}</td><td>{agg[a]['n']}</td></tr>" for a in arms)
     model = rows[0].get("model", "") if rows else ""
 
     def css(p):
         return (f"--bg:{p['bg']};--panel:{p['panel']};--grid:{p['grid']};--axis:{p['axis']};"
-                f"--t1:{p['t1']};--t2:{p['t2']};--s0:{p['s'][0]};--s1:{p['s'][1]};--s2:{p['s'][2]};")
+                f"--t1:{p['t1']};--t2:{p['t2']};--s0:{p['s'][0]};--s1:{p['s'][1]};--s2:{p['s'][2]};--s3:{p['s'][3]};--s4:{p['s'][4]};")
     html = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Token Benchmark</title><style>
 :root{{{css(LIGHT)}}}
@@ -281,19 +323,22 @@ h1{{font-size:26px;margin:0 0 4px}} .sub{{color:var(--t2);margin:0 0 16px}} .lea
 .card h3{{margin:0 0 10px;font-size:13px;color:var(--t2);font-weight:600;text-transform:uppercase;letter-spacing:.04em}}
 .row{{display:grid;grid-template-columns:1fr;gap:2px;margin-bottom:10px}}
 .lbl{{font-size:12px;color:var(--t2)}} .track{{display:block;height:14px;background:var(--grid);border-radius:3px}}
-.bar{{display:block;height:100%;border-radius:3px}} .s0{{background:var(--s0)}} .s1{{background:var(--s1)}} .s2{{background:var(--s2)}}
+.bar{{display:block;height:100%;border-radius:3px}} .s0{{background:var(--s0)}} .s1{{background:var(--s1)}} .s2{{background:var(--s2)}} .s3{{background:var(--s3)}} .s4{{background:var(--s4)}}
+.kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin:8px 0 20px}}
+.kpi{{background:var(--panel);border:1px solid var(--grid);border-radius:10px;padding:16px}}
+.kv{{font-size:40px;font-weight:700;color:var(--s4);font-variant-numeric:tabular-nums;line-height:1.1}} .kl{{color:var(--t2);font-size:13px;margin-top:6px}}
 .val{{font-variant-numeric:tabular-nums;font-size:13px}}
 table{{width:100%;border-collapse:collapse;margin-top:16px;font-variant-numeric:tabular-nums}}
 td,th{{text-align:left;padding:8px;border-bottom:1px solid var(--grid)}} th{{color:var(--t2);font-weight:600;font-size:13px}}
 .note{{color:var(--t2);font-size:13px;margin-top:16px}}
 </style></head><body><main>
-<h1>Same ticket, three workflows</h1>
-<p class="sub">httpx @ {COMMIT[:8]} (~8.8k LOC) · ticket: RetryTransport · model: {model} · median of runs</p>
+<h1>Same brownfield ticket, different workflows</h1>
+<p class="sub">httpx @ {COMMIT[:8]} (~8.8k LOC) · ticket: {rows[0].get("ticket", "") if rows else ""} · model: {model} · median of {max(g["n"] for g in agg.values())} run(s) · Spec Kit setup (constitution) excluded</p>
 {head}
 <div class="grid">{cards}</div>
-<table><tr><th>Arm</th><th>Hidden acceptance</th><th>Regressions</th><th>Test LOC</th><th>Spec doc lines</th><th>Runs</th></tr>{trs}</table>
+<table><tr><th>Arm</th><th>Hidden acceptance</th><th>Regressions</th><th>Test LOC</th><th>Docs LOC</th><th>Spec doc lines</th><th>Runs</th></tr>{trs}</table>
 <p class="note">Effective tokens = input + 1.25 x cache write + 0.1 x cache read + 5 x output (input-token equivalents, proportional to USD).
-Cost is the CLI's own total_cost_usd. Acceptance tests were never shown to any arm.</p>
+Cost is the CLI's own total_cost_usd. Acceptance tests were never shown to any arm. Regressions = existing httpx tests that newly fail.</p>
 </main></body></html>"""
     p = os.path.join(outdir, "report.html")
     open(p, "w").write(html)
@@ -306,9 +351,11 @@ Cost is the CLI's own total_cost_usd. Acceptance tests were never shown to any a
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arms", default="vibe,speckit,tfd")
+    ap.add_argument("--arms", default="speckit,tfd-bare,tfd-graph")
+    ap.add_argument("--ticket", default="client_retries")
+    ap.add_argument("--with-ponytail", action="store_true")
     ap.add_argument("--model", default="sonnet")
-    ap.add_argument("--budget", default="250k")
+    ap.add_argument("--budget", default="400k")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--work", default=os.path.join(HERE, "work"))
     ap.add_argument("--python", default=sys.executable)
@@ -319,6 +366,8 @@ def main():
     a = ap.parse_args()
     if a.report_only:
         return report(a.report_only)
+    load_ticket(a.ticket)
+    a.arms = a.arms.replace("tfd,", "tfd-graph,").rstrip(",")
 
     os.makedirs(a.work, exist_ok=True)
     base, pt = prepare(a.work)

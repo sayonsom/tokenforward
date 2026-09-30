@@ -1,0 +1,329 @@
+diff --git a/docs/advanced/retries.md b/docs/advanced/retries.md
+new file mode 100644
+index 0000000..2a36945
+--- /dev/null
++++ b/docs/advanced/retries.md
+@@ -0,0 +1,10 @@
++# Retries
++
++Clients can retry idempotent requests on transient failures.
++
++```python
++client = httpx.Client(retries=httpx.Retry(3, backoff_factor=0.5))
++client.get("https://example.org/", extensions={"retries": 0})  # per-request override
++```
++
++Retries apply per hop. Exhausted transport errors raise `httpx.RetryError`.
+diff --git a/httpx/__init__.py b/httpx/__init__.py
+index 6322504..42e5baf 100644
+--- a/httpx/__init__.py
++++ b/httpx/__init__.py
+@@ -82,6 +82,8 @@ __all__ = [
+     "RequestNotRead",
+     "Response",
+     "ResponseNotRead",
++    "Retry",
++    "RetryError",
+     "stream",
+     "StreamClosed",
+     "StreamConsumed",
+diff --git a/httpx/_client.py b/httpx/_client.py
+index 13cd933..818a90b 100644
+--- a/httpx/_client.py
++++ b/httpx/_client.py
+@@ -17,13 +17,17 @@ from ._config import (
+     DEFAULT_TIMEOUT_CONFIG,
+     Limits,
+     Proxy,
++    Retry,
+     Timeout,
++    to_retry,
+ )
+ from ._decoders import SUPPORTED_DECODERS
+ from ._exceptions import (
+     InvalidURL,
+     RemoteProtocolError,
++    RetryError,
+     TooManyRedirects,
++    TransportError,
+     request_context,
+ )
+ from ._models import Cookies, Headers, Request, Response
+@@ -200,8 +204,10 @@ class BaseClient:
+         base_url: URL | str = "",
+         trust_env: bool = True,
+         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
++        retries: int | Retry = 0,
+     ) -> None:
+         event_hooks = {} if event_hooks is None else event_hooks
++        self._retries = to_retry(retries)
+ 
+         self._base_url = self._enforce_trailing_slash(URL(base_url))
+ 
+@@ -250,6 +256,18 @@ class BaseClient:
+             proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
+             return {"all://": proxy}
+ 
++    @property
++    def retries(self) -> Retry:
++        return self._retries
++
++    @retries.setter
++    def retries(self, retries: int | Retry) -> None:
++        self._retries = to_retry(retries)
++
++    def _retry_for(self, request: Request) -> Retry:
++        override = request.extensions.get("retries")
++        return self._retries if override is None else to_retry(override)
++
+     @property
+     def timeout(self) -> Timeout:
+         return self._timeout
+@@ -658,6 +676,7 @@ class Client(BaseClient):
+         base_url: URL | str = "",
+         transport: BaseTransport | None = None,
+         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
++        retries: int | Retry = 0,
+     ) -> None:
+         super().__init__(
+             auth=auth,
+@@ -671,6 +690,7 @@ class Client(BaseClient):
+             base_url=base_url,
+             trust_env=trust_env,
+             default_encoding=default_encoding,
++            retries=retries,
+         )
+ 
+         if http2:
+@@ -1000,8 +1020,41 @@ class Client(BaseClient):
+ 
+     def _send_single_request(self, request: Request) -> Response:
+         """
+-        Sends a single request, without handling any redirections.
++        Sends a single request, without handling any redirections,
++        retrying according to the client or per-request retry policy.
+         """
++        retry = self._retry_for(request)
++        retryable = request.method.upper() in retry.allowed_methods
++        attempt = 0
++        while True:
++            try:
++                response = self._send_single_attempt(request)
++            except TransportError as exc:
++                if not retryable or attempt >= retry.total:
++                    if attempt == 0:
++                        raise
++                    raise RetryError(
++                        f"Retries exhausted after {attempt + 1} attempts",
++                        last_exception=exc,
++                        attempts=attempt + 1,
++                        request=request,
++                    ) from exc
++                attempt += 1
++                time.sleep(retry.backoff_for(attempt))
++                continue
++            if (
++                retryable
++                and attempt < retry.total
++                and response.status_code in retry.status_forcelist
++            ):
++                response.close()
++                attempt += 1
++                time.sleep(retry.backoff_for(attempt, response))
++                continue
++            response.extensions = {**response.extensions, "retries": attempt}
++            return response
++
++    def _send_single_attempt(self, request: Request) -> Response:
+         transport = self._transport_for_url(request.url)
+         start = time.perf_counter()
+ 
+@@ -1372,6 +1425,7 @@ class AsyncClient(BaseClient):
+         transport: AsyncBaseTransport | None = None,
+         trust_env: bool = True,
+         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
++        retries: int | Retry = 0,
+     ) -> None:
+         super().__init__(
+             auth=auth,
+@@ -1385,6 +1439,7 @@ class AsyncClient(BaseClient):
+             base_url=base_url,
+             trust_env=trust_env,
+             default_encoding=default_encoding,
++            retries=retries,
+         )
+ 
+         if http2:
+@@ -1716,8 +1771,43 @@ class AsyncClient(BaseClient):
+ 
+     async def _send_single_request(self, request: Request) -> Response:
+         """
+-        Sends a single request, without handling any redirections.
++        Sends a single request, without handling any redirections,
++        retrying according to the client or per-request retry policy.
+         """
++        import anyio
++
++        retry = self._retry_for(request)
++        retryable = request.method.upper() in retry.allowed_methods
++        attempt = 0
++        while True:
++            try:
++                response = await self._send_single_attempt(request)
++            except TransportError as exc:
++                if not retryable or attempt >= retry.total:
++                    if attempt == 0:
++                        raise
++                    raise RetryError(
++                        f"Retries exhausted after {attempt + 1} attempts",
++                        last_exception=exc,
++                        attempts=attempt + 1,
++                        request=request,
++                    ) from exc
++                attempt += 1
++                await anyio.sleep(retry.backoff_for(attempt))
++                continue
++            if (
++                retryable
++                and attempt < retry.total
++                and response.status_code in retry.status_forcelist
++            ):
++                await response.aclose()
++                attempt += 1
++                await anyio.sleep(retry.backoff_for(attempt, response))
++                continue
++            response.extensions = {**response.extensions, "retries": attempt}
++            return response
++
++    async def _send_single_attempt(self, request: Request) -> Response:
+         transport = self._transport_for_url(request.url)
+         start = time.perf_counter()
+ 
+diff --git a/httpx/_config.py b/httpx/_config.py
+index 467a6c9..126d752 100644
+--- a/httpx/_config.py
++++ b/httpx/_config.py
+@@ -10,7 +10,7 @@ from ._urls import URL
+ if typing.TYPE_CHECKING:
+     import ssl  # pragma: no cover
+ 
+-__all__ = ["Limits", "Proxy", "Timeout", "create_ssl_context"]
++__all__ = ["Limits", "Proxy", "Retry", "Timeout", "create_ssl_context"]
+ 
+ 
+ class UnsetType:
+@@ -246,3 +246,57 @@ class Proxy:
+ DEFAULT_TIMEOUT_CONFIG = Timeout(timeout=5.0)
+ DEFAULT_LIMITS = Limits(max_connections=100, max_keepalive_connections=20)
+ DEFAULT_MAX_REDIRECTS = 20
++
++
++class Retry:
++    """
++    Retry configuration for clients.
++
++    **Usage**:
++
++    Retry()  # up to 3 retries with exponential backoff
++    Retry(0)  # disabled
++    """
++
++    def __init__(
++        self,
++        total: int = 3,
++        *,
++        backoff_factor: float = 0.5,
++        status_forcelist: typing.Iterable[int] = (429, 500, 502, 503, 504),
++        allowed_methods: typing.Iterable[str] = (
++            "GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE",
++        ),
++        respect_retry_after: bool = True,
++    ) -> None:
++        self.total = total
++        self.backoff_factor = backoff_factor
++        self.status_forcelist = tuple(status_forcelist)
++        self.allowed_methods = tuple(m.upper() for m in allowed_methods)
++        self.respect_retry_after = respect_retry_after
++
++    def backoff_for(self, attempt: int, response: typing.Any = None) -> float:
++        if self.respect_retry_after and response is not None:
++            value = response.headers.get("Retry-After", "")
++            if value.isdigit():
++                return int(value)
++        return self.backoff_factor * 2 ** (attempt - 1)
++
++    def _key(self) -> tuple[typing.Any, ...]:
++        return (self.total, self.backoff_factor, self.status_forcelist,
++                self.allowed_methods, self.respect_retry_after)
++
++    def __eq__(self, other: typing.Any) -> bool:
++        return isinstance(other, Retry) and self._key() == other._key()
++
++    def __repr__(self) -> str:
++        return (
++            f"Retry(total={self.total}, backoff_factor={self.backoff_factor}, "
++            f"status_forcelist={self.status_forcelist}, "
++            f"allowed_methods={self.allowed_methods}, "
++            f"respect_retry_after={self.respect_retry_after})"
++        )
++
++
++def to_retry(value: "int | Retry") -> Retry:
++    return value if isinstance(value, Retry) else Retry(total=int(value))
+diff --git a/httpx/_exceptions.py b/httpx/_exceptions.py
+index dd7fb6c..20787e3 100644
+--- a/httpx/_exceptions.py
++++ b/httpx/_exceptions.py
+@@ -21,6 +21,7 @@ Our exception hierarchy:
+       - UnsupportedProtocol
+     + DecodingError
+     + TooManyRedirects
++    + RetryError
+   x HTTPStatusError
+ * InvalidURL
+ * CookieConflict
+@@ -58,6 +59,7 @@ __all__ = [
+     "RemoteProtocolError",
+     "RequestError",
+     "RequestNotRead",
++    "RetryError",
+     "ResponseNotRead",
+     "StreamClosed",
+     "StreamConsumed",
+@@ -120,6 +122,24 @@ class RequestError(HTTPError):
+         self._request = request
+ 
+ 
++class RetryError(RequestError):
++    """
++    Retries were exhausted after repeated transport errors.
++    """
++
++    def __init__(
++        self,
++        message: str,
++        *,
++        last_exception: Exception,
++        attempts: int,
++        request: Request | None = None,
++    ) -> None:
++        super().__init__(message, request=request)
++        self.last_exception = last_exception
++        self.attempts = attempts
++
++
+ class TransportError(RequestError):
+     """
+     Base class for all exceptions that occur at the level of the Transport API.
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 86ca1e5..bdea5df 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -36,6 +36,7 @@ nav:
+         - Transports: 'advanced/transports.md'
+         - Text Encodings: 'advanced/text-encodings.md'
+         - Extensions: 'advanced/extensions.md'
++        - Retries: 'advanced/retries.md'
+     - Guides:
+         - Async Support: 'async.md'
+         - HTTP/2 Support: 'http2.md'

@@ -51,4 +51,4 @@ Env: `TF_ENFORCE=0` (track only), `TF_BIG_FILE_LINES=300`. `python3 scripts/tf.p
 
 ## Benchmark
 
-`bench/` runs vibe vs Spec Kit vs TokenForward on the same httpx ticket with hidden acceptance tests. See `CLASS.md`.
+`bench/` runs Spec Kit (warm) vs TokenForward vs TokenForward + graphify (plus optional Spec Kit + TokenForward, vibe) on a complex httpx ticket with 18 hidden acceptance tests. See `CLASS.md`.
