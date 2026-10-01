@@ -69,6 +69,7 @@ def keywords(item: str) -> list[str]:
     ticks = [t for t in re.findall(r"`([^`]+)`", item) if "/" not in t]  # paths handled separately
     ks: list[str] = []
     for t in ticks:
+        t = re.sub(r"\(.*", "", t)          # `f(a, b=1)` -> `f`: argument names are not code locations
         for ident in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", t):
             if len(ident) >= 3 and ident.lower() not in STOP and ident not in ("np", "numpy") \
                     and not ident.startswith("__"):

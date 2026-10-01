@@ -98,12 +98,12 @@ def log(*a):
 
 # ---------------- prepare ----------------
 
-def wheel_site(py, version):
+def wheel_site(py, version, pkg="numpy"):
     """site-packages dir holding the prebuilt numpy wheel (queried from / so the source tree never shadows it)."""
-    r = sh([py, "-c", "import numpy, os; print(numpy.__version__); print(os.path.dirname(os.path.dirname(numpy.__file__)))"], cwd=os.path.abspath(os.sep))
+    r = sh([py, "-c", f"import {pkg} as m, os; print(m.__version__); print(os.path.dirname(os.path.dirname(m.__file__)))"], cwd=os.path.abspath(os.sep))
     v, site = r.stdout.split()
     if v != version:
-        raise SystemExit(f"need numpy=={version} installed in {py}, found {v}")
+        raise SystemExit(f"need {pkg}=={version} installed in {py}, found {v}")
     return site
 
 
@@ -116,15 +116,15 @@ def prepare(work, a):
         else:
             sh(["git", "clone", "-q", "-c", "core.autocrlf=false", TARGET["repo"], base])
             sh(["git", "checkout", "-q", TARGET["commit"]], cwd=base)
-        if TARGET["mode"] == "numpy-overlay":
-            site = wheel_site(a.python, TARGET["wheel_version"])
-            src = open(os.path.join(TARGET["ticket_dir"], "run_tests.py"), encoding="utf-8").read()
+        if TARGET["mode"] in ("numpy-overlay", "wheel-overlay"):
+            site = wheel_site(a.python, TARGET["wheel_version"], TARGET.get("package", "numpy"))
+            src = open(os.path.join(HERE, "tickets", "run_tests_template.py"), encoding="utf-8").read()
             src = src.replace("__WHEEL_SITE__", site).replace("__PYTHON__", a.python) \
-                     .replace("__NP_VERSION__", TARGET["wheel_version"])
+                     .replace("__NP_VERSION__", TARGET["wheel_version"]).replace("__PKG__", TARGET.get("package", "numpy"))
             with open(os.path.join(base, "run_tests.py"), "w", encoding="utf-8") as f:
                 f.write(src)
             with open(os.path.join(base, ".git", "info", "exclude"), "a") as f:
-                f.write("\n.numpy-overlay/\n")
+                f.write("\n.overlay/\n")
             git_commit(base, "bench env")
         sh(["git", "tag", "-f", "bench-base"], cwd=base)
     pt = os.path.join(work, "ponytail")
@@ -151,9 +151,9 @@ def a_python():
 def failing(repo, paths, py, acceptance=False):
     """Run pytest against an arm checkout. Returns (failed ids, passed count, tail)."""
     env = dict(os.environ)
-    if TARGET["mode"] == "numpy-overlay":
+    if TARGET["mode"] in ("numpy-overlay", "wheel-overlay"):
         sh([a_python(), os.path.join(repo, "run_tests.py"), "--sync-only"], cwd=repo)
-        ov = os.path.join(repo, ".numpy-overlay")
+        ov = os.path.join(repo, ".overlay")
         if acceptance:
             env.update(PYTHONPATH=ov, NP_REPO=repo)
             return _pytest(TARGET["ticket_dir"], paths, py, env)

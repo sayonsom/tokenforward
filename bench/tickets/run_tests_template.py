@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""numpy is not compiled in this checkout. This copies a prebuilt numpy __NP_VERSION__ into .numpy-overlay/,
-overlays every Python/stub file you changed or added under numpy/, then runs pytest there.
+"""__PKG__ is not compiled in this checkout. This copies a prebuilt __PKG__ __NP_VERSION__ into .overlay/,
+overlays every Python/stub file you changed or added under __PKG__/, then runs pytest there.
 Works on Windows, macOS and Linux.
 
-Usage: python run_tests.py numpy/lib/tests/test_function_base.py -k average -q
+Usage: python run_tests.py __PKG__/tests/... -k name -q
        python run_tests.py --sync-only
 """
 import os
@@ -14,7 +14,8 @@ import sys
 WHEEL_SITE = r"__WHEEL_SITE__"
 PYTHON = r"__PYTHON__"
 ROOT = os.path.dirname(os.path.abspath(__file__))
-OV = os.path.join(ROOT, ".numpy-overlay")
+PKG = "__PKG__"
+OV = os.path.join(ROOT, ".overlay")
 
 
 def git(*args):
@@ -31,12 +32,12 @@ def sync():
     if os.path.exists(OV):
         shutil.rmtree(OV, onerror=_rm_readonly)
     os.makedirs(OV)
-    shutil.copytree(os.path.join(WHEEL_SITE, "numpy"), os.path.join(OV, "numpy"))
-    libs = os.path.join(WHEEL_SITE, "numpy.libs")
+    shutil.copytree(os.path.join(WHEEL_SITE, PKG), os.path.join(OV, PKG))
+    libs = os.path.join(WHEEL_SITE, PKG + ".libs")
     if os.path.isdir(libs):
-        shutil.copytree(libs, os.path.join(OV, "numpy.libs"))
-    changed = set(git("diff", "--name-only", "bench-base", "--", "numpy"))
-    changed |= set(git("ls-files", "-o", "--exclude-standard", "--", "numpy"))
+        shutil.copytree(libs, os.path.join(OV, PKG + ".libs"))
+    changed = set(git("diff", "--name-only", "bench-base", "--", PKG))
+    changed |= set(git("ls-files", "-o", "--exclude-standard", "--", PKG))
     for f in sorted(changed):
         src = os.path.join(ROOT, f)
         if f.endswith((".py", ".pyi")) and os.path.isfile(src):

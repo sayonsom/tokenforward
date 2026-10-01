@@ -1,0 +1,4 @@
+{"name": "pandas", "label": "pandas v3.0.6", "repo": "https://github.com/pandas-dev/pandas.git",
+ "ref": "v3.0.6", "mode": "wheel-overlay", "package": "pandas", "wheel_version": "3.0.6",
+ "regress": ["pandas/tests/strings"],
+ "plan_hint": "Pure Python changes only; follow the existing pandas string accessor, object_array and arrow mixin patterns."}
