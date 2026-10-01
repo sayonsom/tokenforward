@@ -80,7 +80,7 @@ def demo(name, work):
     step(f"Prebuilt {name} {d['version']} test env (no compile)")
     if not os.path.exists(py):
         run(["uv", "venv", "-q", "--python", "3.12", env])
-    run(["uv", "pip", "install", "-q", "--python", py, f"{name}=={d['version']}", "pytest", "hypothesis"])
+    run(["uv", "pip", "install", "-q", "--python", py, f"{name}=={d['version']}", "pytest", "hypothesis", "tzdata"])
     site = run([py, "-c", f"import {name} as m, os; print(os.path.dirname(os.path.dirname(m.__file__)))"],
                cwd=os.path.abspath(os.sep)).stdout.strip()
 
