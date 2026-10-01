@@ -405,6 +405,46 @@ def cmd_plan(argv: list[str]):
     print(json.dumps(res, indent=1) if a.json else tf_plan.render(res))
 
 
+def cmd_sessions(argv: list[str]):
+    """tf sessions [dir ...]  Token totals of recent Claude Code sessions run in these folders (default: cwd)."""
+    dirs = [os.path.normcase(os.path.abspath(d)) for d in (argv or [os.getcwd()])]
+    root = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    rows = []
+    for f in glob.glob(os.path.join(root, "*", "*.jsonl")):
+        if time.time() - os.path.getmtime(f) > 3 * 86400:
+            continue
+        cwd = ""
+        with open(f, encoding="utf-8", errors="ignore") as fh:
+            for i, line in enumerate(fh):
+                m = re.search(r'"cwd":\s*"((?:[^"\\]|\\.)*)"', line)
+                if m:
+                    cwd = json.loads('"' + m.group(1) + '"')
+                    break
+                if i > 50:
+                    break
+        if not cwd:
+            continue
+        nc = os.path.normcase(os.path.abspath(cwd))
+        if not any(nc == d or nc.startswith(d + os.sep) for d in dirs):
+            continue
+        u = usage(f)
+        if u["turns"]:
+            rows.append((os.path.getmtime(f), os.path.basename(f)[:8], cwd, u))
+    rows.sort()
+    if not rows:
+        print("No sessions found for", ", ".join(dirs))
+        return
+    print(f"{'when':<6} {'session':<9} {'folder':<28} {'turns':>5} {'eff. tokens':>12} {'raw tokens':>12} {'~USD':>7}")
+    for t, sid, cwd, u in rows:
+        raw = u["input"] + u["cache_write"] + u["cache_read"] + u["output"]
+        print(f"{time.strftime('%H:%M', time.localtime(t)):<6} {sid:<9} {os.path.basename(cwd)[:28]:<28} "
+              f"{u['turns']:>5} {u['etok']:>12,} {raw:>12,} {u['etok'] * USD_PER_MTOK / 1e6:>7.2f}")
+    if len(rows) >= 2:
+        a, b = rows[-2][3]["etok"], rows[-1][3]["etok"]
+        hi, lo = max(a, b), min(a, b)
+        print(f"\nLast two sessions: {100 * (1 - lo / hi):.0f}% fewer effective tokens in the cheaper one.")
+
+
 def statusline():
     try:
         ev = json.load(sys.stdin)
@@ -443,6 +483,8 @@ def main():
         except Exception as e:  # a broken hook must never block the user
             eprint(f"tokenforward: {e}")
             sys.exit(0)
+    elif cmd == "sessions":
+        cmd_sessions(sys.argv[2:])
     elif cmd == "plan":
         cmd_plan(sys.argv[2:])
     elif cmd == "statusline":
